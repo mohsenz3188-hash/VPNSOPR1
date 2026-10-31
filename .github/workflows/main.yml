@@ -24,7 +24,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          ZIP=$(find . -maxdepth 1 -name '*.zip' -print -quit)
+          ZIP=$(find . -maxdepth 1 -type f -iname '*.zip' -print -quit)
           if [ -z "$ZIP" ]; then
             echo "Source ZIP not found"
             exit 1
@@ -32,6 +32,7 @@ jobs:
           unzip -oq "$ZIP" -d .
 
       - name: Fix file_picker
+        shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -48,7 +49,7 @@ jobs:
           )
 
           if n != 1:
-              raise SystemExit("file_picker not found")
+              raise SystemExit("file_picker dependency not found")
 
           p.write_text(s)
           PY
@@ -59,7 +60,7 @@ jobs:
           test -f lib/main.dart
           test -f scripts/patch_android.py
 
-      - name: Setup Java
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -68,10 +69,7 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
-          packages: |
-            platform-tools
-            platforms;android-36
-            build-tools;36.0.0
+          packages: 'platform-tools,platforms;android-36,build-tools;36.0.0'
           accept-android-sdk-licenses: true
 
       - name: Setup Flutter
@@ -102,29 +100,37 @@ jobs:
               + list(Path("android").rglob("build.gradle.kts"))
           )
 
-          changed = 0
+          found = False
 
           for p in files:
               s = p.read_text()
-              s = re.sub(
+
+              s, n1 = re.subn(
                   r'(?m)^(\s*compileSdk\s*=\s*)\d+',
                   r'\g<1>36',
                   s
               )
-              s = re.sub(
-                  r'(?m)^(\s*compileSdkVersion\s*)\(?\s*\d+\s*\)?',
+
+              s, n2 = re.subn(
+                  r'(?m)^(\s*compileSdkVersion\s*(?:=\s*)?)\d+',
                   r'\g<1>36',
                   s
               )
 
-              if s != p.read_text():
+              s, n3 = re.subn(
+                  r'(?m)^(\s*compileSdk\s*=\s*)flutter\.compileSdkVersion',
+                  r'\g<1>36',
+                  s
+              )
+
+              if n1 + n2 + n3 > 0:
                   p.write_text(s)
-                  changed += 1
+                  found = True
 
-          if changed == 0:
-              raise SystemExit("compileSdk setting not found")
+          if not found:
+              raise SystemExit("Could not locate compileSdk setting")
 
-          print("Android compileSdk changed to 36")
+          print("Android compile SDK configured: 36")
           PY
 
       - name: Install dependencies
@@ -140,4 +146,3 @@ jobs:
           path: build/app/outputs/flutter-apk/*.apk
           if-no-files-found: error
           retention-days: 14
-          
