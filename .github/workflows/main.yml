@@ -1,32 +1,95 @@
 
-name: vpnsopr
-description: VPNSOPR Android VPN Client
-publish_to: "none"
-version: 1.0.0+1
+name: Build VPNSOPR APK
 
-environment:
-  sdk: ">=3.12.0 <4.0.0"
-  flutter: ">=3.44.0"
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
 
-dependencies:
-  flutter:
-    sdk: flutter
+permissions:
+  contents: read
 
-  flutter_localizations:
-    sdk: flutter
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
 
-  flutter_sing_box: ^3.0.3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-  file_picker: ^13.3.0
+      - name: Extract source ZIP
+        shell: bash
+        run: |
+          set -e
+          ZIP_FILE=""
 
-  mmkv: ^2.4.2
+          for f in VPNSOPR-Android-Source.zip vpnsopr.zip VPNSOPR.zip; do
+            if [ -f "$f" ]; then
+              ZIP_FILE="$f"
+              break
+            fi
+          done
 
-dev_dependencies:
-  flutter_test:
-    sdk: flutter
+          if [ -z "$ZIP_FILE" ]; then
+            ZIP_FILE=$(find . -maxdepth 1 -name '*.zip' -print -quit)
+          fi
 
-  flutter_lints: ^6.0.0
+          if [ -z "$ZIP_FILE" ]; then
+            echo "Source ZIP not found in repository root"
+            exit 1
+          fi
 
-flutter:
-  uses-material-design: true
-  
+          unzip -oq "$ZIP_FILE" -d .
+
+      - name: Validate source
+        run: |
+          test -f pubspec.yaml
+          test -f lib/main.dart
+          test -f scripts/patch_android.py
+          test -f assets/vpnsopr_icon.png
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.0'
+          channel: stable
+          cache: true
+
+      - name: Install Android SDK
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager --install "platforms;android-37" "platform-tools" || true
+
+      - name: Generate Android project
+        run: |
+          if [ ! -f android/app/build.gradle.kts ] && [ ! -f android/app/build.gradle ]; then
+            flutter create --platforms=android --org com.vpnsopr --project-name vpnsopr --no-pub .
+          fi
+
+      - name: Configure Android
+        run: python3 scripts/patch_android.py
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Generate app icon
+        run: dart run flutter_launcher_icons
+
+      - name: Build APK
+        run: flutter build apk --release --split-per-abi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: VPNSOPR-Android-APKs
+          path: build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          
