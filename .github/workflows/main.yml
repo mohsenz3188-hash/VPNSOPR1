@@ -1,1 +1,85 @@
 
+name: Build VPNSOPR APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vpnsopr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build VPNSOPR Android
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate source
+        run: |
+          set -e
+          test -f pubspec.yaml
+          test -f lib/main.dart
+          test -f scripts/patch_android.py
+          test -f assets/vpnsopr_icon.png
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.0'
+          channel: stable
+          cache: true
+
+      - name: Setup Android SDK
+        run: |
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          yes | sdkmanager --licenses || true
+          sdkmanager --install "platforms;android-37" "platform-tools" || true
+
+      - name: Generate Android project
+        run: |
+          if [ ! -f android/app/build.gradle.kts ] && [ ! -f android/app/build.gradle ]; then
+            flutter create --platforms=android --org com.vpnsopr --project-name vpnsopr --no-pub .
+          fi
+
+      - name: Configure Android
+        run: python3 scripts/patch_android.py
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze project
+        run: flutter analyze --no-pub
+
+      - name: Run tests
+        run: flutter test --no-pub
+
+      - name: Generate app icon
+        run: dart run flutter_launcher_icons
+
+      - name: Build APK
+        run: flutter build apk --release --split-per-abi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: VPNSOPR-Android-APKs
+          path: build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 14
+          
