@@ -25,14 +25,15 @@ jobs:
         run: |
           set -e
           ZIP=$(find . -maxdepth 1 -type f -iname '*.zip' -print -quit)
+
           if [ -z "$ZIP" ]; then
             echo "Source ZIP not found"
             exit 1
           fi
+
           unzip -oq "$ZIP" -d .
 
       - name: Fix file_picker
-        shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -49,7 +50,7 @@ jobs:
           )
 
           if n != 1:
-              raise SystemExit("file_picker dependency not found")
+              raise SystemExit("file_picker not found")
 
           p.write_text(s)
           PY
@@ -66,11 +67,23 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
+      - name: Setup Android SDK Tools
         uses: android-actions/setup-android@v4
         with:
-          packages: 'platform-tools,platforms;android-36,build-tools;36.0.0'
+          packages: ''
           accept-android-sdk-licenses: true
+
+      - name: Install Android SDK Packages
+        shell: bash
+        run: |
+          set -e
+
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
+
+          sdkmanager --list_installed
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -79,16 +92,20 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Generate Android project
+      - name: Generate Android Project
         run: |
           if [ ! -f android/app/build.gradle.kts ] && [ ! -f android/app/build.gradle ]; then
-            flutter create --platforms=android --org com.vpnsopr --project-name vpnsopr --no-pub .
+            flutter create \
+              --platforms=android \
+              --org com.vpnsopr \
+              --project-name vpnsopr \
+              --no-pub .
           fi
 
       - name: Configure Android
         run: python3 scripts/patch_android.py
 
-      - name: Fix Android compile SDK
+      - name: Fix Compile SDK
         shell: bash
         run: |
           python3 - <<'PY'
@@ -123,18 +140,21 @@ jobs:
                   s
               )
 
-              if n1 + n2 + n3 > 0:
+              if n1 + n2 + n3:
                   p.write_text(s)
                   found = True
 
           if not found:
-              raise SystemExit("Could not locate compileSdk setting")
+              raise SystemExit("compileSdk not found")
 
-          print("Android compile SDK configured: 36")
+          print("Compile SDK set to 36")
           PY
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: flutter pub get
+
+      - name: Analyze Dart
+        run: flutter analyze --no-pub
 
       - name: Build APK
         run: flutter build apk --release --split-per-abi
@@ -146,3 +166,4 @@ jobs:
           path: build/app/outputs/flutter-apk/*.apk
           if-no-files-found: error
           retention-days: 14
+          
