@@ -12,6 +12,7 @@ permissions:
 
 jobs:
   build:
+    name: Build VPNSOPR Android
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -23,32 +24,46 @@ jobs:
         shell: bash
         run: |
           set -e
-          ZIP_FILE=""
-
-          for f in VPNSOPR-Android-Source.zip vpnsopr.zip VPNSOPR.zip; do
-            if [ -f "$f" ]; then
-              ZIP_FILE="$f"
-              break
-            fi
-          done
-
-          if [ -z "$ZIP_FILE" ]; then
-            ZIP_FILE=$(find . -maxdepth 1 -name '*.zip' -print -quit)
-          fi
-
-          if [ -z "$ZIP_FILE" ]; then
-            echo "Source ZIP not found in repository root"
+          ZIP=$(find . -maxdepth 1 -name '*.zip' -print -quit)
+          if [ -z "$ZIP" ]; then
+            echo "Source ZIP not found"
             exit 1
           fi
+          unzip -oq "$ZIP" -d .
 
-          unzip -oq "$ZIP_FILE" -d .
+      - name: Fix file_picker dependency
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("pubspec.yaml")
+          if not p.exists():
+              raise SystemExit("pubspec.yaml not found")
+
+          content = p.read_text()
+
+          pattern = r'(?m)^([ \t]*file_picker[ \t]*:[ \t]*).*$'
+          updated, count = re.subn(
+              pattern,
+              r'\1^13.3.0',
+              content,
+              count=1
+          )
+
+          if count != 1:
+              raise SystemExit("file_picker dependency not found")
+
+          p.write_text(updated)
+          print("file_picker updated to 13.3.0")
+          PY
 
       - name: Validate source
         run: |
           test -f pubspec.yaml
           test -f lib/main.dart
           test -f scripts/patch_android.py
-          test -f assets/vpnsopr_icon.png
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -63,10 +78,10 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Install Android SDK
+      - name: Setup Android SDK
         run: |
           yes | sdkmanager --licenses || true
-          sdkmanager --install "platforms;android-37" "platform-tools" || true
+          sdkmanager --install "platforms;android-37" "platform-tools"
 
       - name: Generate Android project
         run: |
@@ -80,9 +95,6 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Generate app icon
-        run: dart run flutter_launcher_icons
-
       - name: Build APK
         run: flutter build apk --release --split-per-abi
 
@@ -92,4 +104,5 @@ jobs:
           name: VPNSOPR-Android-APKs
           path: build/app/outputs/flutter-apk/*.apk
           if-no-files-found: error
+          retention-days: 14
           
