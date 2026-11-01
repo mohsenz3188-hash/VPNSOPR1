@@ -1,6 +1,112 @@
 
-      - name: Fix FilePicker API
-        working-directory: ${{ env.PROJECT_DIR }}
+name: Build VPNSOPR Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract Android source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVE="$GITHUB_WORKSPACE/VPNSOPR-Android-Source.zip"
+
+          if [[ ! -f "$ARCHIVE" ]]; then
+            echo "Source archive not found"
+            exit 1
+          fi
+
+          DEST="$RUNNER_TEMP/vpnsopr-source"
+          mkdir -p "$DEST"
+          unzip -q "$ARCHIVE" -d "$DEST"
+
+          PROJECT_DIR=""
+
+          while IFS= read -r candidate; do
+            candidate_dir="${candidate%/pubspec.yaml}"
+            if [[ -f "$candidate_dir/lib/main.dart" ]]; then
+              PROJECT_DIR="$candidate_dir"
+              break
+            fi
+          done < <(find "$DEST" -type f -name pubspec.yaml)
+
+          if [[ -z "$PROJECT_DIR" ]]; then
+            echo "Flutter project not found in ZIP"
+            exit 1
+          fi
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          sdkmanager --channel=3 \
+            "platform-tools" \
+            "platforms;android-37" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.44.0"
+          channel: stable
+          cache: true
+
+      - name: Generate Android project
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -d android ]]; then
+            flutter create \
+              --platforms=android \
+              --org com.vpnsopr \
+              --project-name vpnsopr \
+              --no-pub .
+          fi
+
+          if [[ -f scripts/patch_android.py ]]; then
+            python3 scripts/patch_android.py
+          elif [[ -f patch_android.py ]]; then
+            python3 patch_android.py
+          else
+            echo "Android patch script not found"
+            exit 1
+          fi
+
+      - name: Fix dependencies and desugaring
+        working-directory: ${{ steps.source.outputs.project_dir }}
         shell: bash
         run: |
           set -euo pipefail
@@ -9,124 +115,202 @@
           from pathlib import Path
           import re
 
-          def patch_servers():
-              p = Path("lib/screens/servers_screen.dart")
-              if not p.exists():
-                  raise SystemExit("servers_screen.dart not found")
+          p = Path("pubspec.yaml")
+          s = p.read_text(encoding="utf-8")
 
+          if not re.search(r"(?m)^  mobile_scanner\s*:", s):
+              s, n = re.subn(
+                  r"(?m)^dependencies:\s*$",
+                  "dependencies:\n  mobile_scanner: ^7.4.3",
+                  s, count=1
+              )
+              if n != 1:
+                  raise SystemExit("Cannot update pubspec.yaml")
+
+          p.write_text(s, encoding="utf-8")
+
+          kts = Path("android/app/build.gradle.kts")
+          groovy = Path("android/app/build.gradle")
+
+          if kts.exists():
+              p = kts
               s = p.read_text(encoding="utf-8")
 
-              pattern = (
-                  r"^([ \t]*)final result = await "
-                  r"FilePicker\.platform\.pickFiles\(.*?"
-                  r"^\1final content = utf8\.decode"
-                  r"\(bytes, allowMalformed: false\);"
-              )
-
-              def replace(m):
-                  i = m.group(1)
-                  return (
-                      f"{i}final file = await FilePicker.pickFile(\n"
-                      f"{i}  type: FileType.custom,\n"
-                      f"{i}  allowedExtensions: "
-                      "['conf', 'json', 'yaml', 'yml', 'txt'],\n"
-                      f"{i});\n"
-                      f"{i}if (file == null) return;\n"
-                      f"{i}final bytes = await file.readAsBytes();\n"
-                      f"{i}final content = utf8.decode("
-                      "bytes, allowMalformed: false);"
-                  )
-
-              if "FilePicker.platform" in s:
+              if "isCoreLibraryDesugaringEnabled" not in s:
                   s, n = re.subn(
-                      pattern, replace, s,
-                      count=1, flags=re.MULTILINE | re.DOTALL
+                      r"(compileOptions\s*\{)",
+                      r"\1\n        isCoreLibraryDesugaringEnabled = true",
+                      s, count=1
                   )
                   if n != 1:
-                      raise SystemExit("Could not patch servers_screen.dart")
+                      raise SystemExit("Cannot enable desugaring")
 
-              s = s.replace("import 'dart:io';\n", "")
-
-              if "FilePicker.platform" in s:
-                  raise SystemExit("Old FilePicker API remains in servers")
+              if "desugar_jdk_libs" not in s:
+                  s = re.sub(
+                      r"(?m)^dependencies\s*\{",
+                      'dependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")',
+                      s, count=1
+                  )
 
               p.write_text(s, encoding="utf-8")
-              print("Servers screen fixed")
 
-          def patch_settings():
-              p = Path("lib/screens/settings_screen.dart")
-              if not p.exists():
-                  raise SystemExit("settings_screen.dart not found")
-
+          elif groovy.exists():
+              p = groovy
               s = p.read_text(encoding="utf-8")
 
-              export_pattern = (
-                  r"^([ \t]*)final path = await "
-                  r"FilePicker\.platform\.saveFile\(.*?^\1\);"
-              )
-
-              def replace_export(m):
-                  i = m.group(1)
-                  return (
-                      f"{i}final savedUri = await FilePicker.saveFile(\n"
-                      f"{i}  dialogTitle: 'ذخیره پشتیبان VPNSOPR',\n"
-                      f"{i}  fileName: 'vpnsopr-backup.json',\n"
-                      f"{i}  bytes: Uint8List.fromList(utf8.encode(backup)),\n"
-                      f"{i}  mimeType: 'application/json',\n"
-                      f"{i});"
-                  )
-
-              if "FilePicker.platform.saveFile" in s:
+              if "coreLibraryDesugaringEnabled" not in s:
                   s, n = re.subn(
-                      export_pattern, replace_export, s,
-                      count=1, flags=re.MULTILINE | re.DOTALL
+                      r"(compileOptions\s*\{)",
+                      r"\1\n        coreLibraryDesugaringEnabled true",
+                      s, count=1
                   )
                   if n != 1:
-                      raise SystemExit("Could not patch backup export")
+                      raise SystemExit("Cannot enable desugaring")
 
-              s = s.replace(
-                  "if (context.mounted && path != null)",
-                  "if (context.mounted && savedUri != null)"
-              )
-
-              restore_pattern = (
-                  r"^([ \t]*)final result = await "
-                  r"FilePicker\.platform\.pickFiles\(.*?"
-                  r"^\1final count = await controller\.restoreBackup"
-                  r"\(utf8\.decode\(bytes\)\);"
-              )
-
-              def replace_restore(m):
-                  i = m.group(1)
-                  return (
-                      f"{i}final file = await FilePicker.pickFile(\n"
-                      f"{i}  type: FileType.custom,\n"
-                      f"{i}  allowedExtensions: ['json'],\n"
-                      f"{i});\n"
-                      f"{i}if (file == null) return;\n"
-                      f"{i}final bytes = await file.readAsBytes();\n"
-                      f"{i}final count = await controller.restoreBackup("
-                      "utf8.decode(bytes));"
+              if "desugar_jdk_libs" not in s:
+                  s = re.sub(
+                      r"(?m)^dependencies\s*\{",
+                      "dependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'",
+                      s, count=1
                   )
-
-              if "FilePicker.platform.pickFiles" in s:
-                  s, n = re.subn(
-                      restore_pattern, replace_restore, s,
-                      count=1, flags=re.MULTILINE | re.DOTALL
-                  )
-                  if n != 1:
-                      raise SystemExit("Could not patch backup restore")
-
-              s = s.replace("import 'dart:io';\n", "")
-
-              if "FilePicker.platform" in s:
-                  raise SystemExit("Old FilePicker API remains in settings")
 
               p.write_text(s, encoding="utf-8")
-              print("Settings screen fixed")
+          else:
+              raise SystemExit("Android Gradle file not found")
 
-          patch_servers()
-          patch_settings()
-
-          print("FilePicker migration completed successfully")
+          print("Dependencies fixed")
           PY
+
+      - name: Migrate FilePicker API
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("lib/screens/servers_screen.dart")
+          s = p.read_text(encoding="utf-8")
+
+          pattern = (
+              r"^([ \t]*)final result = await FilePicker\.platform\.pickFiles\(\s*"
+              r"type: FileType\.custom,\s*"
+              r"allowedExtensions: \['conf', 'json', 'yaml', 'yml', 'txt'\],\s*"
+              r"withData: true,\s*\);\s*"
+              r"if \(result == null \|\| result\.files\.isEmpty\) return;\s*"
+              r"final file = result\.files\.first;\s*"
+              r"final bytes = file\.bytes \?\? \(file\.path != null \? "
+              r"await File\(file\.path!\)\.readAsBytes\(\) : null\);\s*"
+              r"if \(bytes == null\) throw Exception\('محتوای فایل قابل خواندن نیست\.'\);"
+          )
+
+          replacement = (
+              r"\1final file = await FilePicker.pickFile(\n"
+              r"\1  type: FileType.custom,\n"
+              r"\1  allowedExtensions: ['conf', 'json', 'yaml', 'yml', 'txt'],\n"
+              r"\1);\n"
+              r"\1if (file == null) return;\n"
+              r"\1final bytes = await file.readAsBytes();"
+          )
+
+          s, n = re.subn(
+              pattern, replacement, s, count=1,
+              flags=re.MULTILINE | re.DOTALL
+          )
+
+          if n == 0 and "FilePicker.platform" in s:
+              raise SystemExit("Servers FilePicker migration failed")
+
+          s = s.replace("import 'dart:io';\n", "")
+          p.write_text(s, encoding="utf-8")
+
+          p = Path("lib/screens/settings_screen.dart")
+          s = p.read_text(encoding="utf-8")
+
+          ep = (
+              r"^([ \t]*)final path = await FilePicker\.platform\.saveFile\(\s*"
+              r"dialogTitle: 'ذخیره پشتیبان VPNSOPR',\s*"
+              r"fileName: 'vpnsopr-backup\.json',\s*"
+              r"type: FileType\.custom,\s*"
+              r"allowedExtensions: \['json'\],\s*"
+              r"bytes: Uint8List\.fromList\(utf8\.encode\(backup\)\),\s*"
+              r"\);\s*"
+              r"if \(context\.mounted && path != null\)"
+          )
+
+          er = (
+              r"\1final savedUri = await FilePicker.saveFile(\n"
+              r"\1  dialogTitle: 'ذخیره پشتیبان VPNSOPR',\n"
+              r"\1  fileName: 'vpnsopr-backup.json',\n"
+              r"\1  bytes: Uint8List.fromList(utf8.encode(backup)),\n"
+              r"\1  mimeType: 'application/json',\n"
+              r"\1);\n"
+              r"\1if (context.mounted && savedUri != null)"
+          )
+
+          s, n1 = re.subn(
+              ep, er, s, count=1,
+              flags=re.MULTILINE | re.DOTALL
+          )
+
+          if n1 == 0 and "FilePicker.platform.saveFile" in s:
+              raise SystemExit("Backup export migration failed")
+
+          rp = (
+              r"^([ \t]*)final result = await FilePicker\.platform\.pickFiles\(\s*"
+              r"type: FileType\.custom,\s*"
+              r"allowedExtensions: \['json'\],\s*"
+              r"withData: true,\s*\);\s*"
+              r"if \(result == null \|\| result\.files\.isEmpty\) return;\s*"
+              r"final file = result\.files\.first;\s*"
+              r"final bytes = file\.bytes \?\? \(file\.path != null \? "
+              r"await File\(file\.path!\)\.readAsBytes\(\) : null\);\s*"
+              r"if \(bytes == null\) throw Exception\('فایل قابل خواندن نیست\.'\);"
+          )
+
+          rr = (
+              r"\1final file = await FilePicker.pickFile(\n"
+              r"\1  type: FileType.custom,\n"
+              r"\1  allowedExtensions: ['json'],\n"
+              r"\1);\n"
+              r"\1if (file == null) return;\n"
+              r"\1final bytes = await file.readAsBytes();"
+          )
+
+          s, n2 = re.subn(
+              rp, rr, s, count=1,
+              flags=re.MULTILINE | re.DOTALL
+          )
+
+          if n2 == 0 and "FilePicker.platform.pickFiles" in s:
+              raise SystemExit("Backup restore migration failed")
+
+          if "FilePicker.platform" in s:
+              raise SystemExit("Old FilePicker API remains")
+
+          s = s.replace("import 'dart:io';\n", "")
+          p.write_text(s, encoding="utf-8")
+
+          print("FilePicker migration completed")
+          PY
+
+      - name: Build release APKs
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          flutter --version
+          flutter pub get
+          flutter build apk --release --split-per-abi
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: VPNSOPR-Android-APKs
+          path: ${{ steps.source.outputs.project_dir }}/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 7
+          
