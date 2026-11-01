@@ -27,7 +27,11 @@ jobs:
           set -euo pipefail
 
           ZIP="$GITHUB_WORKSPACE/VPNSOPR-Android-Source.zip"
-          test -f "$ZIP"
+
+          test -f "$ZIP" || {
+            echo "Source ZIP not found"
+            exit 1
+          }
 
           mkdir -p "$RUNNER_TEMP/vpnsopr"
           unzip -q "$ZIP" -d "$RUNNER_TEMP/vpnsopr"
@@ -67,10 +71,9 @@ jobs:
 
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
 
-          if [ -z "$SDK_ROOT" ]; then
-            echo "Android SDK path not found"
-            exit 1
-          fi
+          test -n "$SDK_ROOT"
+
+          yes | sdkmanager --licenses >/dev/null || true
 
           sdkmanager --install \
             "platform-tools" \
@@ -82,9 +85,6 @@ jobs:
 
           test -d "$PLATFORM_DIR/android-37.0"
 
-          # AGP looks for android-37 while SDK Manager
-          # installs the platform as android-37.0.
-
           if [ -e "$PLATFORM_DIR/android-37" ] && \
              [ ! -L "$PLATFORM_DIR/android-37" ]; then
             rm -rf "$PLATFORM_DIR/android-37"
@@ -92,9 +92,9 @@ jobs:
 
           ln -sfn android-37.0 "$PLATFORM_DIR/android-37"
 
-          echo "Installed Android SDK:"
-          ls -ld "$PLATFORM_DIR/android-37"
-          ls -ld "$PLATFORM_DIR/android-37.0"
+          test -d "$PLATFORM_DIR/android-37"
+
+          echo "Android SDK 37 installed"
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -117,7 +117,10 @@ jobs:
               --no-pub .
           fi
 
-      - name: Configure Dependencies
+          test -f android/app/build.gradle.kts || \
+          test -f android/app/build.gradle
+
+      - name: Configure Dependencies and Android
         working-directory: ${{ steps.source.outputs.project }}
         shell: bash
         run: |
@@ -127,196 +130,225 @@ jobs:
           from pathlib import Path
           import re
 
+          # Configure file_picker
           pub = Path("pubspec.yaml")
-          s = pub.read_text(encoding="utf-8")
+          text = pub.read_text(encoding="utf-8")
 
-          s, n = re.subn(
-              r'(?m)^(\s*file_picker:\s*).+$',
-              r'\g<1>^13.3.0',
-              s,
-              count=1
+          text, count = re.subn(
+              r"(?m)^([ \t]*file_picker:[ \t]*).+$",
+              r"\g<1>^13.3.0",
+              text,
+              count=1,
           )
 
-          if n != 1:
-              raise SystemExit("file_picker not found")
+          if count != 1:
+              raise SystemExit("file_picker dependency not found")
 
-          pub.write_text(s, encoding="utf-8")
+          # Add QR scanner dependency
+          if not re.search(r"(?m)^[ \t]*mobile_scanner[ \t]*:", text):
+              text, count = re.subn(
+                  r"(?m)^([ \t]*file_picker:[ \t]*.*)$",
+                  r"\1\n  mobile_scanner: ^7.4.3",
+                  text,
+                  count=1,
+              )
 
-          for p in Path("lib").rglob("*.dart"):
-              s = p.read_text(encoding="utf-8")
+              if count != 1:
+                  raise SystemExit("Could not add mobile_scanner")
 
-              s = s.replace(
+          pub.write_text(text, encoding="utf-8")
+
+          # Migrate file_picker API to version 13
+          for dart_file in Path("lib").rglob("*.dart"):
+
+              source = dart_file.read_text(encoding="utf-8")
+
+              source = source.replace(
                   "FilePicker.platform.pickFiles(",
-                  "FilePicker.pickFiles("
+                  "FilePicker.pickFiles(",
               )
 
-              s = s.replace(
+              source = source.replace(
                   "FilePicker.platform.saveFile(",
-                  "FilePicker.saveFile("
+                  "FilePicker.saveFile(",
               )
 
-              s = re.sub(
-                  r'(?m)^[ \t]*withData:\s*true,\s*\n',
-                  '',
-                  s
+              source = re.sub(
+                  r"(?m)^[ \t]*withData:[ \t]*true,[ \t]*\n",
+                  "",
+                  source,
               )
 
-              s = s.replace(
+              source = source.replace(
                   "if (result == null || result.files.isEmpty) return;",
-                  "if (result.isEmpty) return;"
+                  "if (result.isEmpty) return;",
               )
 
-              s = s.replace(
+              source = source.replace(
                   "final file = result.files.first;",
-                  "final file = result.first;"
+                  "final file = result.first;",
               )
 
-              s = s.replace(
+              source = source.replace(
                   "final bytes = file.bytes ?? (file.path != null ? await File(file.path!).readAsBytes() : null);",
-                  "final bytes = await file.readAsBytes();"
+                  "final bytes = await file.readAsBytes();",
               )
 
-              s = s.replace(
+              source = source.replace(
                   "        type: FileType.custom,\n        allowedExtensions: ['json'],\n        bytes:",
-                  "        bytes:"
+                  "        bytes:",
               )
 
-              if not re.search(r'\bFile\s*\(', s):
-                  s = re.sub(
-                      r"(?m)^import 'dart:io';\s*\n",
+              if not re.search(r"\bFile\s*\(", source):
+                  source = re.sub(
+                      r"(?m)^import 'dart:io';[ \t]*\n",
                       "",
-                      s
+                      source,
                   )
 
-              p.write_text(s, encoding="utf-8")
+              dart_file.write_text(source, encoding="utf-8")
 
+          # Configure Android Gradle
           kts = Path("android/app/build.gradle.kts")
           groovy = Path("android/app/build.gradle")
 
           if kts.exists():
-              p = kts
-              s = p.read_text(encoding="utf-8")
+
+              path = kts
+              source = path.read_text(encoding="utf-8")
 
               for key, value in [
                   ("compileSdk", "37"),
-                  ("minSdk", "26")
+                  ("minSdk", "26"),
               ]:
-                  pattern = rf'(?m)^(\s*{key}\s*=\s*).+$'
-                  s, n = re.subn(
+
+                  pattern = rf"(?m)^([ \t]*{key}[ \t]*=[ \t]*).+$"
+
+                  source, count = re.subn(
                       pattern,
                       lambda m: m.group(1) + value,
-                      s,
-                      count=1
+                      source,
+                      count=1,
                   )
 
-                  if n != 1:
-                      raise SystemExit(f"Cannot configure {key}")
+                  if count != 1:
+                      raise SystemExit(f"Could not configure {key}")
 
-              s = re.sub(
-                  r'(?m)^(\s*sourceCompatibility\s*=\s*)JavaVersion\.\w+.*$',
-                  r'\g<1>JavaVersion.VERSION_17',
-                  s
+              source = re.sub(
+                  r"(?m)^([ \t]*sourceCompatibility[ \t]*=[ \t]*)JavaVersion\.\w+.*$",
+                  r"\g<1>JavaVersion.VERSION_17",
+                  source,
               )
 
-              s = re.sub(
-                  r'(?m)^(\s*targetCompatibility\s*=\s*)JavaVersion\.\w+.*$',
-                  r'\g<1>JavaVersion.VERSION_17',
-                  s
+              source = re.sub(
+                  r"(?m)^([ \t]*targetCompatibility[ \t]*=[ \t]*)JavaVersion\.\w+.*$",
+                  r"\g<1>JavaVersion.VERSION_17",
+                  source,
               )
 
-              if "isCoreLibraryDesugaringEnabled" not in s:
-                  s, n = re.subn(
-                      r'(compileOptions\s*\{)',
-                      r'\1\n        isCoreLibraryDesugaringEnabled = true',
-                      s,
-                      count=1
-                  )
-
-                  if n != 1:
-                      raise SystemExit("Cannot enable desugaring")
-
-              dep = 'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")'
-
-              if "desugar_jdk_libs" not in s:
-                  s, n = re.subn(
-                      r'(?m)^(\s*dependencies\s*\{)',
-                      lambda m: m.group(1) + '\n    ' + dep,
-                      s,
-                      count=1
-                  )
-
-                  if n != 1:
-                      raise SystemExit("Cannot add desugaring dependency")
+              source = re.sub(
+                  r'(?m)^([ \t]*jvmTarget[ \t]*=[ \t]*).+$',
+                  r'\g<1>"17"',
+                  source,
+              )
 
           elif groovy.exists():
-              p = groovy
-              s = p.read_text(encoding="utf-8")
+
+              path = groovy
+              source = path.read_text(encoding="utf-8")
 
               for key, value in [
                   ("compileSdkVersion", "37"),
-                  ("minSdkVersion", "26")
+                  ("minSdkVersion", "26"),
               ]:
-                  pattern = rf'(?m)^(\s*{key}\s+).+$'
-                  s, n = re.subn(
+
+                  if re.search(rf"(?m)^[ \t]*{key}[ \t]+", source):
+                      pattern = rf"(?m)^([ \t]*{key}[ \t]+).+$"
+                  else:
+                      key = "compileSdk" if key == "compileSdkVersion" else "minSdk"
+                      pattern = rf"(?m)^([ \t]*{key}[ \t]+).+$"
+
+                  source, count = re.subn(
                       pattern,
                       lambda m: m.group(1) + value,
-                      s,
-                      count=1
+                      source,
+                      count=1,
                   )
 
-                  if n != 1:
-                      raise SystemExit(f"Cannot configure {key}")
+                  if count != 1:
+                      raise SystemExit(f"Could not configure {key}")
 
-              if "coreLibraryDesugaringEnabled" not in s:
-                  s = re.sub(
-                      r'(compileOptions\s*\{)',
-                      r'\1\n        coreLibraryDesugaringEnabled true',
-                      s,
-                      count=1
-                  )
+              source = re.sub(
+                  r"(?m)^([ \t]*sourceCompatibility[ \t]+)JavaVersion\.\w+.*$",
+                  r"\g<1>JavaVersion.VERSION_17",
+                  source,
+              )
 
-              if "desugar_jdk_libs" not in s:
-                  dep = "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'"
+              source = re.sub(
+                  r"(?m)^([ \t]*targetCompatibility[ \t]+)JavaVersion\.\w+.*$",
+                  r"\g<1>JavaVersion.VERSION_17",
+                  source,
+              )
 
-                  s = re.sub(
-                      r'(?m)^(\s*dependencies\s*\{)',
-                      lambda m: m.group(1) + '\n    ' + dep,
-                      s,
-                      count=1
-                  )
+              source = re.sub(
+                  r'(?m)^([ \t]*jvmTarget[ \t]*=[ \t]*).+$',
+                  r'\g<1>"17"',
+                  source,
+              )
 
           else:
               raise SystemExit("Android Gradle file not found")
 
-          p.write_text(s, encoding="utf-8")
+          path.write_text(source, encoding="utf-8")
 
+          # Flutter 3.44 compatibility with legacy Kotlin mode
+          gradle_properties = Path("android/gradle.properties")
+
+          if gradle_properties.exists():
+
+              gp = gradle_properties.read_text(encoding="utf-8")
+
+              if "android.builtInKotlin=" not in gp:
+
+                  gradle_properties.write_text(
+                      gp.rstrip() + "\nandroid.builtInKotlin=false\n",
+                      encoding="utf-8",
+                  )
+
+          # Android manifest
           manifest = Path("android/app/src/main/AndroidManifest.xml")
 
           if manifest.exists():
+
               m = manifest.read_text(encoding="utf-8")
 
               m = re.sub(
                   r'android:label="[^"]*"',
                   'android:label="TUN VPNSOPR"',
                   m,
-                  count=1
+                  count=1,
               )
 
               if "android.permission.CAMERA" not in m:
+
                   match = re.search(r"<manifest\b[^>]*>", m)
 
-                  if match:
-                      m = (
-                          m[:match.end()]
-                          + '\n    <uses-permission android:name="android.permission.CAMERA" />'
-                          + m[match.end():]
-                      )
+                  if not match:
+                      raise SystemExit("Manifest tag not found")
+
+                  m = (
+                      m[:match.end()]
+                      + '\n    <uses-permission android:name="android.permission.CAMERA" />'
+                      + m[match.end():]
+                  )
 
               manifest.write_text(m, encoding="utf-8")
 
-          print("Dependencies configured")
+          print("file_picker configured")
+          print("mobile_scanner configured")
           print("Android SDK 37 configured")
           print("Java 17 configured")
+          print("Android configuration completed")
           PY
 
       - name: Clean and Resolve
@@ -337,21 +369,21 @@ jobs:
           PLUGIN_DIR="$(python3 - <<'PY'
           import json
           from pathlib import Path
-          from urllib.parse import urlparse, unquote
+          from urllib.parse import unquote, urlparse
 
           config = json.loads(
-              Path(".dart_tool/package_config.json").read_text()
+              Path(".dart_tool/package_config.json").read_text(encoding="utf-8")
           )
 
           package = next(
-              p for p in config["packages"]
-              if p["name"] == "flutter_sing_box"
+              item for item in config["packages"]
+              if item["name"] == "flutter_sing_box"
           )
 
           uri = urlparse(package["rootUri"])
 
           if uri.scheme != "file":
-              raise SystemExit("Invalid plugin package URI")
+              raise SystemExit("Invalid package URI")
 
           print(unquote(uri.path))
           PY
@@ -361,10 +393,7 @@ jobs:
           LIBDIR="$PLUGIN_DIR/android/libs"
           AAR="$LIBDIR/libbox.aar"
 
-          if [ ! -f "$GRADLE" ]; then
-            echo "Plugin Gradle file not found"
-            exit 1
-          fi
+          test -f "$GRADLE"
 
           mkdir -p "$LIBDIR"
 
@@ -379,26 +408,25 @@ jobs:
           test -s "$AAR"
           unzip -tq "$AAR"
 
-          echo "Official libbox AAR downloaded successfully"
-
           python3 - "$GRADLE" <<'PY'
           from pathlib import Path
           import sys
 
-          p = Path(sys.argv[1])
-          s = p.read_text(encoding="utf-8")
+          path = Path(sys.argv[1])
+          source = path.read_text(encoding="utf-8")
 
           old = 'implementation("com.github.singbox-android:libbox:1.14.3")'
           new = 'implementation(files("libs/libbox.aar"))'
 
-          if old in s:
-              s = s.replace(old, new, 1)
-          elif new not in s:
-              raise SystemExit("Expected libbox dependency not found")
+          if old in source:
+              source = source.replace(old, new, 1)
 
-          p.write_text(s, encoding="utf-8")
+          elif new not in source:
+              raise SystemExit("libbox dependency not found")
 
-          print("Gradle uses local libbox AAR")
+          path.write_text(source, encoding="utf-8")
+
+          print("Local libbox configured")
           PY
 
       - name: Verify Native Dependency
@@ -407,17 +435,31 @@ jobs:
         run: |
           set -euo pipefail
 
-          PLUGIN_DIR="$(find "$HOME/.pub-cache/hosted/pub.dev" \
-            -maxdepth 1 -type d \
-            -name 'flutter_sing_box-*' | head -n 1)"
+          PLUGIN_DIR="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import unquote, urlparse
 
-          test -n "$PLUGIN_DIR"
+          config = json.loads(
+              Path(".dart_tool/package_config.json").read_text(encoding="utf-8")
+          )
+
+          package = next(
+              item for item in config["packages"]
+              if item["name"] == "flutter_sing_box"
+          )
+
+          uri = urlparse(package["rootUri"])
+          print(unquote(uri.path))
+          PY
+          )"
+
           test -s "$PLUGIN_DIR/android/libs/libbox.aar"
 
-          grep -n 'libbox.aar' \
+          grep -q 'libbox.aar' \
             "$PLUGIN_DIR/android/build.gradle.kts"
 
-          echo "Native dependency verification passed"
+          echo "Native dependency verified"
 
       - name: Verify Android SDK
         shell: bash
@@ -427,9 +469,9 @@ jobs:
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
 
           test -d "$SDK_ROOT/platforms/android-37"
-          test -d "$SDK_ROOT/platforms/android-37.0"
+          test -d "$SDK_ROOT/build-tools/37.0.0"
 
-          echo "Android SDK verification passed"
+          echo "Android SDK verified"
 
       - name: Build Release APK
         working-directory: ${{ steps.source.outputs.project }}
@@ -439,13 +481,13 @@ jobs:
 
           flutter build apk \
             --release \
-            --split-per-abi
+            --target-platform android-arm64
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: VPNSOPR-Android-APKs
-          path: ${{ steps.source.outputs.project }}/build/app/outputs/flutter-apk/*.apk
+          name: VPNSOPR-Android-ARM64
+          path: ${{ steps.source.outputs.project }}/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
           retention-days: 7
           
