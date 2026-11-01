@@ -28,7 +28,10 @@ jobs:
 
           ZIP="$GITHUB_WORKSPACE/VPNSOPR-Android-Source.zip"
 
-          test -f "$ZIP"
+          if [ ! -f "$ZIP" ]; then
+            echo "Source ZIP not found"
+            exit 1
+          fi
 
           mkdir -p "$RUNNER_TEMP/vpnsopr"
           unzip -q "$ZIP" -d "$RUNNER_TEMP/vpnsopr"
@@ -50,7 +53,7 @@ jobs:
 
           echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
 
-      - name: Setup Java
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -61,7 +64,7 @@ jobs:
         with:
           packages: platform-tools
 
-      - name: Install Android Packages
+      - name: Install Android SDK Packages
         shell: bash
         run: |
           set -euo pipefail
@@ -79,7 +82,7 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Prepare Android Project
+      - name: Prepare Android
         working-directory: ${{ steps.source.outputs.project }}
         shell: bash
         run: |
@@ -93,7 +96,7 @@ jobs:
               --no-pub .
           fi
 
-      - name: Fix Dependencies and Android SDK
+      - name: Fix Dependencies and FilePicker API
         working-directory: ${{ steps.source.outputs.project }}
         shell: bash
         run: |
@@ -103,12 +106,13 @@ jobs:
           from pathlib import Path
           import re
 
+          # Fix pubspec
           pub = Path("pubspec.yaml")
           s = pub.read_text(encoding="utf-8")
 
           s, n = re.subn(
               r'(?m)^(\s*file_picker:\s*).+$',
-              r'\g<1>^11.0.2',
+              r'\g<1>^13.3.0',
               s,
               count=1
           )
@@ -118,6 +122,81 @@ jobs:
 
           pub.write_text(s, encoding="utf-8")
 
+          # Migrate FilePicker API
+          dart_files = list(Path("lib").rglob("*.dart"))
+
+          if not dart_files:
+              raise SystemExit("No Dart source files found")
+
+          for p in dart_files:
+              s = p.read_text(encoding="utf-8")
+
+              s = s.replace(
+                  "FilePicker.platform.pickFiles(",
+                  "FilePicker.pickFiles("
+              )
+
+              s = s.replace(
+                  "FilePicker.platform.saveFile(",
+                  "FilePicker.saveFile("
+              )
+
+              s = re.sub(
+                  r'(?m)^[ \t]*withData:\s*true,\s*\n',
+                  '',
+                  s
+              )
+
+              s = s.replace(
+                  "if (result == null || result.files.isEmpty) return;",
+                  "if (result.isEmpty) return;"
+              )
+
+              s = s.replace(
+                  "final file = result.files.first;",
+                  "final file = result.first;"
+              )
+
+              s = s.replace(
+                  "final bytes = file.bytes ?? (file.path != null ? await File(file.path!).readAsBytes() : null);",
+                  "final bytes = await file.readAsBytes();"
+              )
+
+              s = s.replace(
+                  "        type: FileType.custom,\n        allowedExtensions: ['json'],\n        bytes:",
+                  "        bytes:"
+              )
+
+              s = re.sub(
+                  r"(?m)^\s*if \(bytes == null\) throw Exception\('(محتوای فایل قابل خواندن نیست|فایل قابل خواندن نیست)\.'\);\s*\n",
+                  "",
+                  s
+              )
+
+              # Remove unused dart:io import when File is no longer used
+              if not re.search(r'\bFile\s*\(', s):
+                  s = re.sub(
+                      r"(?m)^import 'dart:io';\s*\n",
+                      "",
+                      s
+                  )
+
+              # Make sure old APIs are gone
+              if "FilePicker.platform." in s:
+                  raise SystemExit(
+                      f"Old FilePicker API remains in {p}"
+                  )
+
+              if "result.files.first" in s or "file.bytes ??" in s:
+                  raise SystemExit(
+                      f"FilePicker migration incomplete in {p}"
+                  )
+
+              p.write_text(s, encoding="utf-8")
+
+          print("FilePicker API migration completed")
+
+          # Fix Android Gradle configuration
           kts = Path("android/app/build.gradle.kts")
           groovy = Path("android/app/build.gradle")
 
@@ -137,7 +216,7 @@ jobs:
                       count=1
                   )
                   if n != 1:
-                      raise SystemExit(f"Cannot set {key}")
+                      raise SystemExit(f"Cannot configure {key}")
 
               s = re.sub(
                   r'(?m)^(\s*sourceCompatibility\s*=\s*)JavaVersion\.\w+.*$',
@@ -190,7 +269,7 @@ jobs:
                       count=1
                   )
                   if n != 1:
-                      raise SystemExit(f"Cannot set {key}")
+                      raise SystemExit(f"Cannot configure {key}")
 
               if "coreLibraryDesugaringEnabled" not in s:
                   s, n = re.subn(
@@ -204,6 +283,7 @@ jobs:
 
               if "desugar_jdk_libs" not in s:
                   dep = "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'"
+
                   if re.search(r'(?m)^\s*dependencies\s*\{', s):
                       s = re.sub(
                           r'(?m)^(\s*dependencies\s*\{)',
@@ -219,6 +299,11 @@ jobs:
 
           p.write_text(s, encoding="utf-8")
 
+          print("Android SDK 36 configured")
+          print("Java 17 configured")
+          print("Desugaring configured")
+
+          # Manifest
           manifest = Path("android/app/src/main/AndroidManifest.xml")
 
           if manifest.exists():
@@ -242,21 +327,22 @@ jobs:
 
               manifest.write_text(m, encoding="utf-8")
 
-          print("Android SDK 36 configured")
-          print("Java 17 configured")
-          print("Desugaring configured")
-          print("FilePicker compatibility configured")
+          print("Project preparation completed")
           PY
 
       - name: Clean and Resolve
         working-directory: ${{ steps.source.outputs.project }}
+        shell: bash
         run: |
+          set -euo pipefail
           flutter clean
           flutter pub get
 
-      - name: Build APK
+      - name: Build Release APK
         working-directory: ${{ steps.source.outputs.project }}
+        shell: bash
         run: |
+          set -euo pipefail
           flutter build apk --release --split-per-abi
 
       - name: Upload APK
