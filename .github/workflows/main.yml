@@ -14,7 +14,7 @@ jobs:
   build:
     name: Build VPNSOPR Android
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -28,10 +28,7 @@ jobs:
 
           ZIP="$GITHUB_WORKSPACE/VPNSOPR-Android-Source.zip"
 
-          if [ ! -f "$ZIP" ]; then
-            echo "Source ZIP not found"
-            exit 1
-          fi
+          test -f "$ZIP"
 
           mkdir -p "$RUNNER_TEMP/vpnsopr"
           unzip -q "$ZIP" -d "$RUNNER_TEMP/vpnsopr"
@@ -71,7 +68,7 @@ jobs:
 
           sdkmanager --install \
             "platform-tools" \
-            "platforms;android-36" \
+            "platforms;android-37" \
             "build-tools;36.0.0" \
             "ndk;28.2.13676358"
 
@@ -82,7 +79,7 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Prepare Android
+      - name: Prepare Android Project
         working-directory: ${{ steps.source.outputs.project }}
         shell: bash
         run: |
@@ -96,7 +93,7 @@ jobs:
               --no-pub .
           fi
 
-      - name: Fix Dependencies and FilePicker API
+      - name: Configure Dependencies
         working-directory: ${{ steps.source.outputs.project }}
         shell: bash
         run: |
@@ -106,7 +103,6 @@ jobs:
           from pathlib import Path
           import re
 
-          # Fix pubspec
           pub = Path("pubspec.yaml")
           s = pub.read_text(encoding="utf-8")
 
@@ -118,17 +114,11 @@ jobs:
           )
 
           if n != 1:
-              raise SystemExit("file_picker dependency not found")
+              raise SystemExit("file_picker not found")
 
           pub.write_text(s, encoding="utf-8")
 
-          # Migrate FilePicker API
-          dart_files = list(Path("lib").rglob("*.dart"))
-
-          if not dart_files:
-              raise SystemExit("No Dart source files found")
-
-          for p in dart_files:
+          for p in Path("lib").rglob("*.dart"):
               s = p.read_text(encoding="utf-8")
 
               s = s.replace(
@@ -167,13 +157,6 @@ jobs:
                   "        bytes:"
               )
 
-              s = re.sub(
-                  r"(?m)^\s*if \(bytes == null\) throw Exception\('(محتوای فایل قابل خواندن نیست|فایل قابل خواندن نیست)\.'\);\s*\n",
-                  "",
-                  s
-              )
-
-              # Remove unused dart:io import when File is no longer used
               if not re.search(r'\bFile\s*\(', s):
                   s = re.sub(
                       r"(?m)^import 'dart:io';\s*\n",
@@ -181,22 +164,9 @@ jobs:
                       s
                   )
 
-              # Make sure old APIs are gone
-              if "FilePicker.platform." in s:
-                  raise SystemExit(
-                      f"Old FilePicker API remains in {p}"
-                  )
-
-              if "result.files.first" in s or "file.bytes ??" in s:
-                  raise SystemExit(
-                      f"FilePicker migration incomplete in {p}"
-                  )
-
               p.write_text(s, encoding="utf-8")
 
-          print("FilePicker API migration completed")
-
-          # Fix Android Gradle configuration
+          # Android configuration
           kts = Path("android/app/build.gradle.kts")
           groovy = Path("android/app/build.gradle")
 
@@ -205,7 +175,7 @@ jobs:
               s = p.read_text(encoding="utf-8")
 
               for key, value in [
-                  ("compileSdk", "36"),
+                  ("compileSdk", "37"),
                   ("minSdk", "26")
               ]:
                   pattern = rf'(?m)^(\s*{key}\s*=\s*).+$'
@@ -243,22 +213,19 @@ jobs:
               dep = 'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")'
 
               if "desugar_jdk_libs" not in s:
-                  if re.search(r'(?m)^\s*dependencies\s*\{', s):
-                      s = re.sub(
-                          r'(?m)^(\s*dependencies\s*\{)',
-                          lambda m: m.group(1) + '\n    ' + dep,
-                          s,
-                          count=1
-                      )
-                  else:
-                      s += '\ndependencies {\n    ' + dep + '\n}\n'
+                  s = re.sub(
+                      r'(?m)^(\s*dependencies\s*\{)',
+                      lambda m: m.group(1) + '\n    ' + dep,
+                      s,
+                      count=1
+                  )
 
           elif groovy.exists():
               p = groovy
               s = p.read_text(encoding="utf-8")
 
               for key, value in [
-                  ("compileSdkVersion", "36"),
+                  ("compileSdkVersion", "37"),
                   ("minSdkVersion", "26")
               ]:
                   pattern = rf'(?m)^(\s*{key}\s+).+$'
@@ -272,38 +239,27 @@ jobs:
                       raise SystemExit(f"Cannot configure {key}")
 
               if "coreLibraryDesugaringEnabled" not in s:
-                  s, n = re.subn(
+                  s = re.sub(
                       r'(compileOptions\s*\{)',
                       r'\1\n        coreLibraryDesugaringEnabled true',
                       s,
                       count=1
                   )
-                  if n != 1:
-                      raise SystemExit("Cannot enable desugaring")
 
               if "desugar_jdk_libs" not in s:
                   dep = "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'"
-
-                  if re.search(r'(?m)^\s*dependencies\s*\{', s):
-                      s = re.sub(
-                          r'(?m)^(\s*dependencies\s*\{)',
-                          lambda m: m.group(1) + '\n    ' + dep,
-                          s,
-                          count=1
-                      )
-                  else:
-                      s += '\ndependencies {\n    ' + dep + '\n}\n'
+                  s = re.sub(
+                      r'(?m)^(\s*dependencies\s*\{)',
+                      lambda m: m.group(1) + '\n    ' + dep,
+                      s,
+                      count=1
+                  )
 
           else:
               raise SystemExit("Android Gradle file not found")
 
           p.write_text(s, encoding="utf-8")
 
-          print("Android SDK 36 configured")
-          print("Java 17 configured")
-          print("Desugaring configured")
-
-          # Manifest
           manifest = Path("android/app/src/main/AndroidManifest.xml")
 
           if manifest.exists():
@@ -327,7 +283,9 @@ jobs:
 
               manifest.write_text(m, encoding="utf-8")
 
-          print("Project preparation completed")
+          print("Dependencies configured")
+          print("Android SDK 37 configured")
+          print("Java 17 configured")
           PY
 
       - name: Clean and Resolve
@@ -338,12 +296,107 @@ jobs:
           flutter clean
           flutter pub get
 
+      - name: Download Official SingBox AAR
+        working-directory: ${{ steps.source.outputs.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PLUGIN_DIR="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import urlparse, unquote
+
+          config = json.loads(
+              Path(".dart_tool/package_config.json").read_text()
+          )
+
+          package = next(
+              p for p in config["packages"]
+              if p["name"] == "flutter_sing_box"
+          )
+
+          uri = urlparse(package["rootUri"])
+
+          if uri.scheme != "file":
+              raise SystemExit("Invalid plugin package URI")
+
+          print(unquote(uri.path))
+          PY
+          )"
+
+          GRADLE="$PLUGIN_DIR/android/build.gradle.kts"
+          LIBDIR="$PLUGIN_DIR/android/libs"
+          AAR="$LIBDIR/libbox.aar"
+
+          if [ ! -f "$GRADLE" ]; then
+            echo "Plugin Gradle file not found"
+            exit 1
+          fi
+
+          mkdir -p "$LIBDIR"
+
+          curl -fL \
+            --retry 5 \
+            --retry-all-errors \
+            --retry-delay 3 \
+            --connect-timeout 30 \
+            "https://github.com/singbox-android/libbox/releases/download/1.14.3/libbox.aar" \
+            -o "$AAR"
+
+          test -s "$AAR"
+
+          unzip -tq "$AAR"
+
+          echo "Official libbox AAR downloaded successfully"
+
+          python3 - "$GRADLE" <<'PY'
+          from pathlib import Path
+          import sys
+
+          p = Path(sys.argv[1])
+          s = p.read_text(encoding="utf-8")
+
+          old = 'implementation("com.github.singbox-android:libbox:1.14.3")'
+          new = 'implementation(files("libs/libbox.aar"))'
+
+          if old in s:
+              s = s.replace(old, new, 1)
+          elif new not in s:
+              raise SystemExit("Expected libbox dependency not found")
+
+          p.write_text(s, encoding="utf-8")
+
+          print("Gradle now uses the local libbox AAR")
+          PY
+
+      - name: Verify Native Dependency
+        working-directory: ${{ steps.source.outputs.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PLUGIN_DIR="$(find "$HOME/.pub-cache/hosted/pub.dev" \
+            -maxdepth 1 -type d \
+            -name 'flutter_sing_box-*' | head -n 1)"
+
+          test -n "$PLUGIN_DIR"
+          test -s "$PLUGIN_DIR/android/libs/libbox.aar"
+
+          grep -n 'libbox.aar' \
+            "$PLUGIN_DIR/android/build.gradle.kts"
+
+          echo "Native dependency verification passed"
+
       - name: Build Release APK
         working-directory: ${{ steps.source.outputs.project }}
         shell: bash
         run: |
           set -euo pipefail
-          flutter build apk --release --split-per-abi
+
+          flutter build apk \
+            --release \
+            --split-per-abi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -352,4 +405,3 @@ jobs:
           path: ${{ steps.source.outputs.project }}/build/app/outputs/flutter-apk/*.apk
           if-no-files-found: error
           retention-days: 7
-          
