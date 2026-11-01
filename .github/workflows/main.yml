@@ -1,5 +1,5 @@
 
-name: Build VPNSOPR Android
+name: Build VPNSOPR APK
 
 on:
   workflow_dispatch:
@@ -10,91 +10,96 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: vpnsopr-android-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
-    name: Build VPNSOPR APK
+  build-android:
+    name: Build Android APKs
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract source ZIP
+      - name: Extract and validate the exact source archive
         shell: bash
         run: |
-          set -e
-          ZIP=$(find . -maxdepth 1 -type f -iname '*.zip' -print -quit)
+          set -euo pipefail
 
-          if [ -z "$ZIP" ]; then
-            echo "Source ZIP not found"
+          ARCHIVE="VPNSOPR-Android-Source.zip"
+
+          if [[ ! -f "$ARCHIVE" ]]; then
+            echo "::error::Upload VPNSOPR-Android-Source.zip to the repository root."
             exit 1
           fi
 
-          unzip -oq "$ZIP" -d .
+          unzip -oq "$ARCHIVE" -d .
 
-      - name: Fix file_picker
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          p = Path("pubspec.yaml")
-          s = p.read_text()
-
-          s, n = re.subn(
-              r'(?m)^([ \t]*file_picker[ \t]*:[ \t]*).*$',
-              r'\1^13.3.0',
-              s,
-              count=1
+          required_files=(
+            "pubspec.yaml"
+            "lib/main.dart"
+            "lib/app.dart"
+            "lib/theme.dart"
+            "lib/core/vpn_controller.dart"
+            "lib/screens/servers_screen.dart"
+            "lib/screens/settings_screen.dart"
+            "assets/vpnsopr_icon.png"
+            "scripts/patch_android.py"
+            "test/widget_test.dart"
           )
 
-          if n != 1:
-              raise SystemExit("file_picker not found")
+          for file in "${required_files[@]}"; do
+            if [[ ! -f "$file" ]]; then
+              echo "::error::Missing required project file: $file"
+              exit 1
+            fi
+          done
 
-          p.write_text(s)
-          PY
+          echo "VPNSOPR source archive extracted and validated."
 
-      - name: Validate source
-        run: |
-          test -f pubspec.yaml
-          test -f lib/main.dart
-          test -f scripts/patch_android.py
-
-      - name: Setup Java 17
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      - name: Setup Android SDK Tools
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
-          packages: ''
+          packages: ""
           accept-android-sdk-licenses: true
 
-      - name: Install Android SDK Packages
+      - name: Install Android SDK packages
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
+          yes | sdkmanager --licenses >/dev/null || true
 
           sdkmanager --install \
             "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0"
 
-          sdkmanager --list_installed
-
-      - name: Setup Flutter
+      - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.44.0'
+          flutter-version: "3.44.0"
           channel: stable
           cache: true
 
-      - name: Generate Android Project
+      - name: Check Flutter toolchain
         run: |
-          if [ ! -f android/app/build.gradle.kts ] && [ ! -f android/app/build.gradle ]; then
+          flutter --version
+          flutter doctor -v
+
+      - name: Generate Android project if missing
+        shell: bash
+        run: |
+          if [[ ! -f android/app/build.gradle.kts && ! -f android/app/build.gradle ]]; then
             flutter create \
               --platforms=android \
               --org com.vpnsopr \
@@ -102,64 +107,70 @@ jobs:
               --no-pub .
           fi
 
-      - name: Configure Android
+      - name: Configure Android project
         run: python3 scripts/patch_android.py
 
-      - name: Fix Compile SDK
+      - name: Set Android compile SDK to 36
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import re
 
-          files = (
-              list(Path("android").rglob("build.gradle"))
-              + list(Path("android").rglob("build.gradle.kts"))
-          )
+          android = Path("android")
+          files = list(android.rglob("build.gradle")) + list(android.rglob("build.gradle.kts"))
+          changed = False
 
-          found = False
+          for path in files:
+              source = path.read_text(encoding="utf-8")
+              updated = source
 
-          for p in files:
-              s = p.read_text()
-
-              s, n1 = re.subn(
-                  r'(?m)^(\s*compileSdk\s*=\s*)\d+',
-                  r'\g<1>36',
-                  s
+              updated, n1 = re.subn(
+                  r"(?m)^(\s*compileSdk\s*=\s*)\d+.*$",
+                  r"\g<1>36",
+                  updated,
               )
 
-              s, n2 = re.subn(
-                  r'(?m)^(\s*compileSdkVersion\s*(?:=\s*)?)\d+',
-                  r'\g<1>36',
-                  s
+              updated, n2 = re.subn(
+                  r"(?m)^(\s*compileSdk\s*=\s*)flutter\.compileSdkVersion\s*$",
+                  r"\g<1>36",
+                  updated,
               )
 
-              s, n3 = re.subn(
-                  r'(?m)^(\s*compileSdk\s*=\s*)flutter\.compileSdkVersion',
-                  r'\g<1>36',
-                  s
+              updated, n3 = re.subn(
+                  r"(?m)^(\s*compileSdkVersion\s*(?:=\s*)?)\d+.*$",
+                  r"\g<1>36",
+                  updated,
               )
 
               if n1 + n2 + n3:
-                  p.write_text(s)
-                  found = True
+                  path.write_text(updated, encoding="utf-8")
+                  changed = True
 
-          if not found:
-              raise SystemExit("compileSdk not found")
+          if not changed:
+              raise SystemExit(
+                  "Could not find a compileSdk setting in Android Gradle files."
+              )
 
-          print("Compile SDK set to 36")
+          print("Android compile SDK set to 36.")
           PY
 
-      - name: Install Dependencies
+      - name: Resolve Flutter dependencies
         run: flutter pub get
 
-      - name: Analyze Dart
+      - name: Analyze Dart source
         run: flutter analyze --no-pub
 
-      - name: Build APK
+      - name: Run Flutter tests
+        run: flutter test --no-pub
+
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+
+      - name: Build release APKs
         run: flutter build apk --release --split-per-abi
 
-      - name: Upload APK
+      - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
           name: VPNSOPR-Android-APKs
