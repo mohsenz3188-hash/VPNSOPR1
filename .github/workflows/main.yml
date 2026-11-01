@@ -27,7 +27,6 @@ jobs:
           set -euo pipefail
 
           ZIP="$GITHUB_WORKSPACE/VPNSOPR-Android-Source.zip"
-
           test -f "$ZIP"
 
           mkdir -p "$RUNNER_TEMP/vpnsopr"
@@ -66,11 +65,36 @@ jobs:
         run: |
           set -euo pipefail
 
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+
+          if [ -z "$SDK_ROOT" ]; then
+            echo "Android SDK path not found"
+            exit 1
+          fi
+
           sdkmanager --install \
             "platform-tools" \
-            "platforms;android-37" \
-            "build-tools;36.0.0" \
+            "platforms;android-37.0" \
+            "build-tools;37.0.0" \
             "ndk;28.2.13676358"
+
+          PLATFORM_DIR="$SDK_ROOT/platforms"
+
+          test -d "$PLATFORM_DIR/android-37.0"
+
+          # AGP looks for android-37 while SDK Manager
+          # installs the platform as android-37.0.
+
+          if [ -e "$PLATFORM_DIR/android-37" ] && \
+             [ ! -L "$PLATFORM_DIR/android-37" ]; then
+            rm -rf "$PLATFORM_DIR/android-37"
+          fi
+
+          ln -sfn android-37.0 "$PLATFORM_DIR/android-37"
+
+          echo "Installed Android SDK:"
+          ls -ld "$PLATFORM_DIR/android-37"
+          ls -ld "$PLATFORM_DIR/android-37.0"
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -166,7 +190,6 @@ jobs:
 
               p.write_text(s, encoding="utf-8")
 
-          # Android configuration
           kts = Path("android/app/build.gradle.kts")
           groovy = Path("android/app/build.gradle")
 
@@ -185,6 +208,7 @@ jobs:
                       s,
                       count=1
                   )
+
                   if n != 1:
                       raise SystemExit(f"Cannot configure {key}")
 
@@ -207,18 +231,22 @@ jobs:
                       s,
                       count=1
                   )
+
                   if n != 1:
                       raise SystemExit("Cannot enable desugaring")
 
               dep = 'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")'
 
               if "desugar_jdk_libs" not in s:
-                  s = re.sub(
+                  s, n = re.subn(
                       r'(?m)^(\s*dependencies\s*\{)',
                       lambda m: m.group(1) + '\n    ' + dep,
                       s,
                       count=1
                   )
+
+                  if n != 1:
+                      raise SystemExit("Cannot add desugaring dependency")
 
           elif groovy.exists():
               p = groovy
@@ -235,6 +263,7 @@ jobs:
                       s,
                       count=1
                   )
+
                   if n != 1:
                       raise SystemExit(f"Cannot configure {key}")
 
@@ -248,6 +277,7 @@ jobs:
 
               if "desugar_jdk_libs" not in s:
                   dep = "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'"
+
                   s = re.sub(
                       r'(?m)^(\s*dependencies\s*\{)',
                       lambda m: m.group(1) + '\n    ' + dep,
@@ -274,6 +304,7 @@ jobs:
 
               if "android.permission.CAMERA" not in m:
                   match = re.search(r"<manifest\b[^>]*>", m)
+
                   if match:
                       m = (
                           m[:match.end()]
@@ -293,6 +324,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           flutter clean
           flutter pub get
 
@@ -345,7 +377,6 @@ jobs:
             -o "$AAR"
 
           test -s "$AAR"
-
           unzip -tq "$AAR"
 
           echo "Official libbox AAR downloaded successfully"
@@ -367,7 +398,7 @@ jobs:
 
           p.write_text(s, encoding="utf-8")
 
-          print("Gradle now uses the local libbox AAR")
+          print("Gradle uses local libbox AAR")
           PY
 
       - name: Verify Native Dependency
@@ -388,6 +419,18 @@ jobs:
 
           echo "Native dependency verification passed"
 
+      - name: Verify Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+
+          test -d "$SDK_ROOT/platforms/android-37"
+          test -d "$SDK_ROOT/platforms/android-37.0"
+
+          echo "Android SDK verification passed"
+
       - name: Build Release APK
         working-directory: ${{ steps.source.outputs.project }}
         shell: bash
@@ -405,3 +448,4 @@ jobs:
           path: ${{ steps.source.outputs.project }}/build/app/outputs/flutter-apk/*.apk
           if-no-files-found: error
           retention-days: 7
+          
