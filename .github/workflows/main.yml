@@ -1,123 +1,5 @@
 
-name: Build VPNSOPR Android APK
-
-on:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: vpnsopr-android-${{ github.ref }}
-  cancel-in-progress: true
-
-jobs:
-  build:
-    name: Build VPNSOPR Android
-    runs-on: ubuntu-22.04
-    timeout-minutes: 60
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Extract Flutter source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ROOT="$GITHUB_WORKSPACE"
-          PROJECT=""
-
-          ZIP="$ROOT/VPNSOPR-Android-Source.zip"
-
-          if [ -f "$ZIP" ]; then
-            rm -rf "$ROOT/_source"
-            mkdir -p "$ROOT/_source"
-            unzip -q "$ZIP" -d "$ROOT/_source"
-
-            while IFS= read -r -d '' file; do
-              dir="$(dirname "$file")"
-              if [ -f "$dir/lib/main.dart" ]; then
-                PROJECT="$dir"
-                break
-              fi
-            done < <(find "$ROOT/_source" -name pubspec.yaml -print0)
-
-            if [ -z "$PROJECT" ]; then
-              FILE="$(find "$ROOT/_source" -name pubspec.yaml -print -quit)"
-              if [ -n "$FILE" ]; then
-                PROJECT="$(dirname "$FILE")"
-              fi
-            fi
-          fi
-
-          if [ -z "$PROJECT" ] && [ -f "$ROOT/pubspec.yaml" ]; then
-            PROJECT="$ROOT"
-          fi
-
-          if [ -z "$PROJECT" ]; then
-            echo "Flutter project not found"
-            exit 1
-          fi
-
-          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
-
-      - name: Setup Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: ''
-          accept-android-sdk-licenses: true
-          log-accepted-android-sdk-licenses: false
-
-      - name: Install Android SDK 37
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sdkmanager --channel=3 --install \
-            "platform-tools" \
-            "platforms;android-37.0" \
-            "build-tools;37.0.0"
-
-          echo "Android SDK 37 installed successfully"
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-
-      - name: Check Flutter
-        run: |
-          flutter --version
-          dart --version
-          flutter doctor -v
-
-      - name: Generate Android project
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ ! -d android ]; then
-            flutter create \
-              --platforms=android \
-              --org com.vpnsopr \
-              --project-name vpnsopr \
-              --no-pub .
-          fi
-
-      - name: Configure VPNSOPR
+      - name: Fix FilePicker API
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
@@ -127,243 +9,125 @@ jobs:
           from pathlib import Path
           import re
 
-          pubspec = Path("pubspec.yaml")
+          def patch_servers():
+              p = Path("lib/screens/servers_screen.dart")
+              if not p.exists():
+                  raise SystemExit("servers_screen.dart not found")
 
-          if not pubspec.exists():
-              raise SystemExit("pubspec.yaml missing")
+              s = p.read_text(encoding="utf-8")
 
-          content = pubspec.read_text(encoding="utf-8")
-
-          pattern = r"(?m)^([ \t]*file_picker[ \t]*:[ \t]*)[^\r\n#]+"
-
-          content, count = re.subn(
-              pattern,
-              r"\g<1>^13.3.0",
-              content,
-              count=1
-          )
-
-          if count == 0:
-              match = re.search(r"(?m)^dependencies:[ \t]*$", content)
-
-              if not match:
-                  raise SystemExit("Dependencies section missing")
-
-              pos = match.end()
-              content = (
-                  content[:pos]
-                  + "\n  file_picker: ^13.3.0"
-                  + content[pos:]
+              pattern = (
+                  r"^([ \t]*)final result = await "
+                  r"FilePicker\.platform\.pickFiles\(.*?"
+                  r"^\1final content = utf8\.decode"
+                  r"\(bytes, allowMalformed: false\);"
               )
 
-          pubspec.write_text(content, encoding="utf-8")
-
-          kts = Path("android/app/build.gradle.kts")
-          groovy = Path("android/app/build.gradle")
-
-          if kts.exists():
-              path = kts
-              is_kts = True
-          elif groovy.exists():
-              path = groovy
-              is_kts = False
-          else:
-              raise SystemExit("Gradle file missing")
-
-          source = path.read_text(encoding="utf-8")
-
-          def replace_one(patterns, replacement, label):
-              global source
-
-              for pattern in patterns:
-                  updated, count = re.subn(
-                      pattern,
-                      replacement,
-                      source,
-                      count=1
+              def replace(m):
+                  i = m.group(1)
+                  return (
+                      f"{i}final file = await FilePicker.pickFile(\n"
+                      f"{i}  type: FileType.custom,\n"
+                      f"{i}  allowedExtensions: "
+                      "['conf', 'json', 'yaml', 'yml', 'txt'],\n"
+                      f"{i});\n"
+                      f"{i}if (file == null) return;\n"
+                      f"{i}final bytes = await file.readAsBytes();\n"
+                      f"{i}final content = utf8.decode("
+                      "bytes, allowMalformed: false);"
                   )
 
-                  if count:
-                      source = updated
-                      return
+              if "FilePicker.platform" in s:
+                  s, n = re.subn(
+                      pattern, replace, s,
+                      count=1, flags=re.MULTILINE | re.DOTALL
+                  )
+                  if n != 1:
+                      raise SystemExit("Could not patch servers_screen.dart")
 
-              raise SystemExit("Cannot configure " + label)
+              s = s.replace("import 'dart:io';\n", "")
 
-          if is_kts:
+              if "FilePicker.platform" in s:
+                  raise SystemExit("Old FilePicker API remains in servers")
 
-              replace_one(
-                  [r"(?m)^([ \t]*compileSdk[ \t]*=[ \t]*).+$"],
-                  r"\g<1>37",
-                  "compileSdk"
+              p.write_text(s, encoding="utf-8")
+              print("Servers screen fixed")
+
+          def patch_settings():
+              p = Path("lib/screens/settings_screen.dart")
+              if not p.exists():
+                  raise SystemExit("settings_screen.dart not found")
+
+              s = p.read_text(encoding="utf-8")
+
+              export_pattern = (
+                  r"^([ \t]*)final path = await "
+                  r"FilePicker\.platform\.saveFile\(.*?^\1\);"
               )
 
-              replace_one(
-                  [r"(?m)^([ \t]*minSdk[ \t]*=[ \t]*).+$"],
-                  r"\g<1>26",
-                  "minSdk"
-              )
-
-              replace_one(
-                  [r"(?m)^([ \t]*sourceCompatibility[ \t]*=[ \t]*).+$"],
-                  r"\g<1>JavaVersion.VERSION_17",
-                  "Java compatibility"
-              )
-
-              replace_one(
-                  [r"(?m)^([ \t]*targetCompatibility[ \t]*=[ \t]*).+$"],
-                  r"\g<1>JavaVersion.VERSION_17",
-                  "Java target"
-              )
-
-              if "isCoreLibraryDesugaringEnabled" not in source:
-                  match = re.search(
-                      r"(?m)^([ \t]*compileOptions[ \t]*\{)",
-                      source
+              def replace_export(m):
+                  i = m.group(1)
+                  return (
+                      f"{i}final savedUri = await FilePicker.saveFile(\n"
+                      f"{i}  dialogTitle: 'ذخیره پشتیبان VPNSOPR',\n"
+                      f"{i}  fileName: 'vpnsopr-backup.json',\n"
+                      f"{i}  bytes: Uint8List.fromList(utf8.encode(backup)),\n"
+                      f"{i}  mimeType: 'application/json',\n"
+                      f"{i});"
                   )
 
-                  if not match:
-                      raise SystemExit("compileOptions missing")
+              if "FilePicker.platform.saveFile" in s:
+                  s, n = re.subn(
+                      export_pattern, replace_export, s,
+                      count=1, flags=re.MULTILINE | re.DOTALL
+                  )
+                  if n != 1:
+                      raise SystemExit("Could not patch backup export")
 
-                  pos = match.end()
+              s = s.replace(
+                  "if (context.mounted && path != null)",
+                  "if (context.mounted && savedUri != null)"
+              )
 
-                  source = (
-                      source[:pos]
-                      + "\n        isCoreLibraryDesugaringEnabled = true"
-                      + source[pos:]
+              restore_pattern = (
+                  r"^([ \t]*)final result = await "
+                  r"FilePicker\.platform\.pickFiles\(.*?"
+                  r"^\1final count = await controller\.restoreBackup"
+                  r"\(utf8\.decode\(bytes\)\);"
+              )
+
+              def replace_restore(m):
+                  i = m.group(1)
+                  return (
+                      f"{i}final file = await FilePicker.pickFile(\n"
+                      f"{i}  type: FileType.custom,\n"
+                      f"{i}  allowedExtensions: ['json'],\n"
+                      f"{i});\n"
+                      f"{i}if (file == null) return;\n"
+                      f"{i}final bytes = await file.readAsBytes();\n"
+                      f"{i}final count = await controller.restoreBackup("
+                      "utf8.decode(bytes));"
                   )
 
-              dependency = (
-                  '    coreLibraryDesugaring('
-                  '"com.android.tools:desugar_jdk_libs:2.1.5")'
-              )
-
-          else:
-
-              replace_one(
-                  [
-                      r"(?m)^([ \t]*compileSdkVersion[ \t]+).+$",
-                      r"(?m)^([ \t]*compileSdk[ \t]+).+$"
-                  ],
-                  r"\g<1>37",
-                  "compileSdk"
-              )
-
-              replace_one(
-                  [
-                      r"(?m)^([ \t]*minSdkVersion[ \t]+).+$",
-                      r"(?m)^([ \t]*minSdk[ \t]+).+$"
-                  ],
-                  r"\g<1>26",
-                  "minSdk"
-              )
-
-              replace_one(
-                  [r"(?m)^([ \t]*sourceCompatibility[ \t]+).+$"],
-                  r"\g<1>JavaVersion.VERSION_17",
-                  "Java compatibility"
-              )
-
-              replace_one(
-                  [r"(?m)^([ \t]*targetCompatibility[ \t]+).+$"],
-                  r"\g<1>JavaVersion.VERSION_17",
-                  "Java target"
-              )
-
-              if "coreLibraryDesugaringEnabled" not in source:
-                  match = re.search(
-                      r"(?m)^([ \t]*compileOptions[ \t]*\{)",
-                      source
+              if "FilePicker.platform.pickFiles" in s:
+                  s, n = re.subn(
+                      restore_pattern, replace_restore, s,
+                      count=1, flags=re.MULTILINE | re.DOTALL
                   )
+                  if n != 1:
+                      raise SystemExit("Could not patch backup restore")
 
-                  if not match:
-                      raise SystemExit("compileOptions missing")
+              s = s.replace("import 'dart:io';\n", "")
 
-                  pos = match.end()
+              if "FilePicker.platform" in s:
+                  raise SystemExit("Old FilePicker API remains in settings")
 
-                  source = (
-                      source[:pos]
-                      + "\n        coreLibraryDesugaringEnabled true"
-                      + source[pos:]
-                  )
+              p.write_text(s, encoding="utf-8")
+              print("Settings screen fixed")
 
-              dependency = (
-                  "    coreLibraryDesugaring "
-                  "'com.android.tools:desugar_jdk_libs:2.1.5'"
-              )
+          patch_servers()
+          patch_settings()
 
-          if "desugar_jdk_libs" not in source:
-              match = re.search(
-                  r"(?m)^([ \t]*dependencies[ \t]*\{)",
-                  source
-              )
-
-              if match:
-                  pos = match.end()
-                  source = (
-                      source[:pos]
-                      + "\n" + dependency
-                      + source[pos:]
-                  )
-              else:
-                  source += (
-                      "\ndependencies {\n"
-                      + dependency
-                      + "\n}\n"
-                  )
-
-          path.write_text(source, encoding="utf-8")
-
-          manifest = Path(
-              "android/app/src/main/AndroidManifest.xml"
-          )
-
-          if manifest.exists():
-              content = manifest.read_text(encoding="utf-8")
-
-              content = re.sub(
-                  r'android:label="[^"]*"',
-                  'android:label="TUN VPNSOPR"',
-                  content,
-                  count=1
-              )
-
-              if "android.permission.CAMERA" not in content:
-                  match = re.search(r"<manifest\b[^>]*>", content)
-
-                  if match:
-                      pos = match.end()
-                      content = (
-                          content[:pos]
-                          + '\n    <uses-permission android:name="android.permission.CAMERA" />'
-                          + content[pos:]
-                      )
-
-              manifest.write_text(content, encoding="utf-8")
-
-          print("VPNSOPR configuration completed")
-          print("Compile SDK: 37")
-          print("Minimum SDK: 26")
-          print("Java: 17")
-          print("Desugaring: enabled")
+          print("FilePicker migration completed successfully")
           PY
-
-      - name: Clean project
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter clean
-
-      - name: Resolve dependencies
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter pub get
-
-      - name: Build release APK
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter build apk --release
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: VPNSOPR-Android-APK
-          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
-          if-no-files-found: error
-          retention-days: 14
           
