@@ -1,3 +1,4 @@
+
 name: Build VPNSOPR Android APK
 
 on:
@@ -10,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: vpnsopr-android-${{ github.ref }}
+  group: vpnsopr-build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -23,51 +24,48 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract and locate Flutter project
+      - name: Extract Flutter source
         shell: bash
         run: |
           set -euo pipefail
 
-          WORK="$GITHUB_WORKSPACE"
-          PROJECT_DIR=""
+          ROOT="$GITHUB_WORKSPACE"
+          PROJECT=""
 
-          ZIP="$WORK/VPNSOPR-Android-Source.zip"
+          ZIP="$ROOT/VPNSOPR-Android-Source.zip"
 
           if [ -f "$ZIP" ]; then
-            rm -rf "$WORK/_source"
-            mkdir -p "$WORK/_source"
-
-            unzip -q "$ZIP" -d "$WORK/_source"
+            rm -rf "$ROOT/_source"
+            mkdir -p "$ROOT/_source"
+            unzip -q "$ZIP" -d "$ROOT/_source"
 
             while IFS= read -r -d '' file; do
               dir="$(dirname "$file")"
-
               if [ -f "$dir/lib/main.dart" ]; then
-                PROJECT_DIR="$dir"
+                PROJECT="$dir"
                 break
               fi
-            done < <(find "$WORK/_source" -type f -name pubspec.yaml -print0)
+            done < <(find "$ROOT/_source" -name pubspec.yaml -print0)
 
-            if [ -z "$PROJECT_DIR" ]; then
-              PUBSPEC="$(find "$WORK/_source" -type f -name pubspec.yaml -print -quit || true)"
-              if [ -n "$PUBSPEC" ]; then
-                PROJECT_DIR="$(dirname "$PUBSPEC")"
+            if [ -z "$PROJECT" ]; then
+              FILE="$(find "$ROOT/_source" -name pubspec.yaml -print -quit)"
+              if [ -n "$FILE" ]; then
+                PROJECT="$(dirname "$FILE")"
               fi
             fi
           fi
 
-          if [ -z "$PROJECT_DIR" ] && [ -f "$WORK/pubspec.yaml" ]; then
-            PROJECT_DIR="$WORK"
+          if [ -z "$PROJECT" ] && [ -f "$ROOT/pubspec.yaml" ]; then
+            PROJECT="$ROOT"
           fi
 
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: Flutter project not found."
+          if [ -z "$PROJECT" ]; then
+            echo "Flutter source not found"
             exit 1
           fi
 
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-          echo "Project located: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
+          echo "Project: $PROJECT"
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -76,18 +74,20 @@ jobs:
           java-version: '17'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
 
       - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
 
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-
           sdkmanager --install \
             "platform-tools" \
-            "platforms;android-36" \
+            "platforms;android-37" \
             "build-tools;36.0.0"
 
       - name: Setup Flutter
@@ -99,9 +99,9 @@ jobs:
       - name: Check Flutter
         run: |
           flutter --version
-          flutter doctor -v
+          dart --version
 
-      - name: Generate Android project if missing
+      - name: Generate Android project
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
@@ -111,10 +111,11 @@ jobs:
             flutter create \
               --platforms=android \
               --org com.vpnsopr \
-              .
+              --project-name vpnsopr \
+              --no-pub .
           fi
 
-      - name: Fix dependencies and Android configuration
+      - name: Configure VPNSOPR dependencies
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
@@ -131,7 +132,9 @@ jobs:
 
           content = pubspec.read_text(encoding="utf-8")
 
-          pattern = r"(?m)^([ \t]*file_picker[ \t]*:[ \t]*)[^\r\n#]+"
+          pattern = (
+              r"(?m)^([ \t]*file_picker[ \t]*:[ \t]*)[^\r\n#]+"
+          )
 
           content, count = re.subn(
               pattern,
@@ -141,190 +144,219 @@ jobs:
           )
 
           if count == 0:
-              dependency = re.search(
-                  r"(?m)^dependencies:\s*$",
+              match = re.search(
+                  r"(?m)^dependencies:[ \t]*$",
                   content
               )
 
-              if dependency is None:
-                  raise SystemExit("dependencies section not found")
+              if not match:
+                  raise SystemExit("Dependencies section not found")
 
-              position = dependency.end()
-
+              pos = match.end()
               content = (
-                  content[:position]
+                  content[:pos]
                   + "\n  file_picker: ^13.3.0"
-                  + content[position:]
+                  + content[pos:]
               )
 
           pubspec.write_text(content, encoding="utf-8")
 
-          print("file_picker set to ^13.3.0")
-
           app = Path("android/app")
 
-          gradle = app / "build.gradle"
-          kotlin_gradle = app / "build.gradle.kts"
+          kts = app / "build.gradle.kts"
+          groovy = app / "build.gradle"
 
-          if gradle.exists():
-              path = gradle
-              kts = False
-          elif kotlin_gradle.exists():
-              path = kotlin_gradle
-              kts = True
+          if kts.exists():
+              path = kts
+              is_kts = True
+          elif groovy.exists():
+              path = groovy
+              is_kts = False
           else:
-              raise SystemExit("Android app Gradle file not found")
+              raise SystemExit("Android Gradle file not found")
 
           text = path.read_text(encoding="utf-8")
 
-          if kts:
-              text = re.sub(
-                  r"(?m)^(\s*compileSdk\s*=\s*).+$",
-                  r"\g<1>36",
-                  text
+          def replace_one(patterns, replacement, label):
+              global text
+
+              for pattern in patterns:
+                  updated, count = re.subn(
+                      pattern,
+                      replacement,
+                      text,
+                      count=1
+                  )
+
+                  if count:
+                      text = updated
+                      return
+
+              raise SystemExit("Cannot configure " + label)
+
+          if is_kts:
+              replace_one(
+                  [r"(?m)^([ \t]*compileSdk[ \t]*=[ \t]*).+$"],
+                  r"\g<1>37",
+                  "compileSdk"
               )
 
-              text = re.sub(
-                  r"(?m)^(\s*minSdk\s*=\s*).+$",
+              replace_one(
+                  [r"(?m)^([ \t]*minSdk[ \t]*=[ \t]*).+$"],
                   r"\g<1>26",
-                  text
+                  "minSdk"
               )
 
-              text = re.sub(
-                  r"(?m)^(\s*sourceCompatibility\s*=\s*).+$",
+              replace_one(
+                  [r"(?m)^([ \t]*sourceCompatibility[ \t]*=[ \t]*).+$"],
                   r"\g<1>JavaVersion.VERSION_17",
-                  text
+                  "sourceCompatibility"
               )
 
-              text = re.sub(
-                  r"(?m)^(\s*targetCompatibility\s*=\s*).+$",
+              replace_one(
+                  [r"(?m)^([ \t]*targetCompatibility[ \t]*=[ \t]*).+$"],
                   r"\g<1>JavaVersion.VERSION_17",
-                  text
+                  "targetCompatibility"
               )
 
               if "isCoreLibraryDesugaringEnabled" not in text:
                   match = re.search(
-                      r"(?m)^(\s*compileOptions\s*\{)",
+                      r"(?m)^([ \t]*compileOptions[ \t]*\{)",
                       text
                   )
 
-                  if match:
-                      pos = match.end()
-                      text = (
-                          text[:pos]
-                          + "\n        isCoreLibraryDesugaringEnabled = true"
-                          + text[pos:]
-                      )
-                  else:
-                      raise SystemExit("compileOptions block not found")
+                  if not match:
+                      raise SystemExit("compileOptions block missing")
 
-              if "desugar_jdk_libs" not in text:
-                  match = re.search(
-                      r"(?m)^(\s*dependencies\s*\{)",
-                      text
+                  pos = match.end()
+                  text = (
+                      text[:pos]
+                      + "\n        isCoreLibraryDesugaringEnabled = true"
+                      + text[pos:]
                   )
 
-                  if match:
-                      pos = match.end()
-                      text = (
-                          text[:pos]
-                          + '\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")'
-                          + text[pos:]
-                      )
-                  else:
-                      text += (
-                          '\ndependencies {\n'
-                          '    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")\n'
-                          '}\n'
-                      )
+              dependency = (
+                  '    coreLibraryDesugaring('
+                  '"com.android.tools:desugar_jdk_libs:2.1.5")'
+              )
 
           else:
-              text = re.sub(
-                  r"(?m)^(\s*compileSdkVersion\s+).+$",
-                  r"\g<1>36",
-                  text
+              replace_one(
+                  [
+                      r"(?m)^([ \t]*compileSdkVersion[ \t]+).+$",
+                      r"(?m)^([ \t]*compileSdk[ \t]+).+$"
+                  ],
+                  r"\g<1>37",
+                  "compileSdk"
               )
 
-              text = re.sub(
-                  r"(?m)^(\s*compileSdk\s+).+$",
-                  r"\g<1>36",
-                  text
-              )
-
-              text = re.sub(
-                  r"(?m)^(\s*minSdkVersion\s+).+$",
+              replace_one(
+                  [
+                      r"(?m)^([ \t]*minSdkVersion[ \t]+).+$",
+                      r"(?m)^([ \t]*minSdk[ \t]+).+$"
+                  ],
                   r"\g<1>26",
-                  text
+                  "minSdk"
               )
 
-              text = re.sub(
-                  r"(?m)^(\s*minSdk\s+).+$",
-                  r"\g<1>26",
-                  text
-              )
-
-              text = re.sub(
-                  r"(?m)^(\s*sourceCompatibility\s+).+$",
+              replace_one(
+                  [r"(?m)^([ \t]*sourceCompatibility[ \t]+).+$"],
                   r"\g<1>JavaVersion.VERSION_17",
-                  text
+                  "sourceCompatibility"
               )
 
-              text = re.sub(
-                  r"(?m)^(\s*targetCompatibility\s+).+$",
+              replace_one(
+                  [r"(?m)^([ \t]*targetCompatibility[ \t]+).+$"],
                   r"\g<1>JavaVersion.VERSION_17",
-                  text
+                  "targetCompatibility"
               )
 
               if "coreLibraryDesugaringEnabled" not in text:
                   match = re.search(
-                      r"(?m)^(\s*compileOptions\s*\{)",
+                      r"(?m)^([ \t]*compileOptions[ \t]*\{)",
                       text
                   )
 
-                  if match:
-                      pos = match.end()
-                      text = (
-                          text[:pos]
-                          + "\n        coreLibraryDesugaringEnabled true"
-                          + text[pos:]
-                      )
-                  else:
-                      raise SystemExit("compileOptions block not found")
+                  if not match:
+                      raise SystemExit("compileOptions block missing")
 
-              if "desugar_jdk_libs" not in text:
-                  match = re.search(
-                      r"(?m)^(\s*dependencies\s*\{)",
-                      text
+                  pos = match.end()
+                  text = (
+                      text[:pos]
+                      + "\n        coreLibraryDesugaringEnabled true"
+                      + text[pos:]
                   )
 
-                  if match:
-                      pos = match.end()
-                      text = (
-                          text[:pos]
-                          + "\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'"
-                          + text[pos:]
-                      )
-                  else:
-                      text += (
-                          "\ndependencies {\n"
-                          "    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'\n"
-                          "}\n"
-                      )
+              dependency = (
+                  "    coreLibraryDesugaring "
+                  "'com.android.tools:desugar_jdk_libs:2.1.5'"
+              )
+
+          if "desugar_jdk_libs" not in text:
+              match = re.search(
+                  r"(?m)^([ \t]*dependencies[ \t]*\{)",
+                  text
+              )
+
+              if match:
+                  pos = match.end()
+                  text = (
+                      text[:pos]
+                      + "\n" + dependency
+                      + text[pos:]
+                  )
+              else:
+                  text += (
+                      "\ndependencies {\n"
+                      + dependency
+                      + "\n}\n"
+                  )
 
           path.write_text(text, encoding="utf-8")
 
-          print("Android Gradle configuration updated")
-          print("Compile SDK: 36")
-          print("Minimum SDK: 26")
+          manifest = Path(
+              "android/app/src/main/AndroidManifest.xml"
+          )
+
+          if manifest.exists():
+              content = manifest.read_text(encoding="utf-8")
+
+              content = re.sub(
+                  r'android:label="[^"]*"',
+                  'android:label="TUN VPNSOPR"',
+                  content,
+                  count=1
+              )
+
+              if "android.permission.CAMERA" not in content:
+                  match = re.search(
+                      r"<manifest\b[^>]*>",
+                      content
+                  )
+
+                  if match:
+                      pos = match.end()
+                      content = (
+                          content[:pos]
+                          + '\n    <uses-permission android:name="android.permission.CAMERA" />'
+                          + content[pos:]
+                      )
+
+              manifest.write_text(content, encoding="utf-8")
+
+          print("VPNSOPR Android configuration completed")
+          print("compileSdk: 37")
+          print("minSdk: 26")
           print("Java: 17")
-          print("Core library desugaring enabled")
+          print("Desugaring: enabled")
+          print("file_picker: ^13.3.0")
           PY
 
-      - name: Clean project
+      - name: Clean Flutter
         working-directory: ${{ env.PROJECT_DIR }}
         run: flutter clean
 
-      - name: Resolve Flutter dependencies
+      - name: Install Flutter dependencies
         working-directory: ${{ env.PROJECT_DIR }}
         run: flutter pub get
 
@@ -332,11 +364,10 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}
         run: flutter build apk --release
 
-      - name: Upload APK artifact
+      - name: Upload VPNSOPR APK
         uses: actions/upload-artifact@v4
         with:
           name: VPNSOPR-Android-APK
           path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
           retention-days: 14
-          
