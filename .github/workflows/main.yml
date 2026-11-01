@@ -1,125 +1,4 @@
 
-name: Build VPNSOPR Android APK
-
-on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-
-permissions:
-  contents: read
-
-jobs:
-  build:
-    name: Build VPNSOPR Android
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Extract Source
-        id: source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ZIP="$GITHUB_WORKSPACE/VPNSOPR-Android-Source.zip"
-
-          test -f "$ZIP" || {
-            echo "Source ZIP not found"
-            exit 1
-          }
-
-          mkdir -p "$RUNNER_TEMP/vpnsopr"
-          unzip -q "$ZIP" -d "$RUNNER_TEMP/vpnsopr"
-
-          PROJECT=""
-
-          while IFS= read -r f; do
-            D="$(dirname "$f")"
-            if [ -f "$D/lib/main.dart" ]; then
-              PROJECT="$D"
-              break
-            fi
-          done < <(find "$RUNNER_TEMP/vpnsopr" -name pubspec.yaml)
-
-          if [ -z "$PROJECT" ]; then
-            echo "Flutter project not found"
-            exit 1
-          fi
-
-          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
-
-      - name: Setup Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: platform-tools
-
-      - name: Install Android SDK Packages
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-
-          test -n "$SDK_ROOT"
-
-          yes | sdkmanager --licenses >/dev/null || true
-
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-37.0" \
-            "build-tools;37.0.0" \
-            "ndk;28.2.13676358"
-
-          PLATFORM_DIR="$SDK_ROOT/platforms"
-
-          test -d "$PLATFORM_DIR/android-37.0"
-
-          if [ -e "$PLATFORM_DIR/android-37" ] && \
-             [ ! -L "$PLATFORM_DIR/android-37" ]; then
-            rm -rf "$PLATFORM_DIR/android-37"
-          fi
-
-          ln -sfn android-37.0 "$PLATFORM_DIR/android-37"
-
-          test -d "$PLATFORM_DIR/android-37"
-
-          echo "Android SDK 37 installed"
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: "3.44.0"
-          channel: stable
-          cache: true
-
-      - name: Prepare Android Project
-        working-directory: ${{ steps.source.outputs.project }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ ! -d android ]; then
-            flutter create \
-              --platforms=android \
-              --org com.vpnsopr \
-              --project-name vpnsopr \
-              --no-pub .
-          fi
-
-          test -f android/app/build.gradle.kts || \
-          test -f android/app/build.gradle
-
       - name: Configure Dependencies and Android
         working-directory: ${{ steps.source.outputs.project }}
         shell: bash
@@ -130,7 +9,7 @@ jobs:
           from pathlib import Path
           import re
 
-          # Configure file_picker
+          # Configure Flutter dependencies
           pub = Path("pubspec.yaml")
           text = pub.read_text(encoding="utf-8")
 
@@ -142,9 +21,8 @@ jobs:
           )
 
           if count != 1:
-              raise SystemExit("file_picker dependency not found")
+              raise SystemExit("file_picker not found")
 
-          # Add QR scanner dependency
           if not re.search(r"(?m)^[ \t]*mobile_scanner[ \t]*:", text):
               text, count = re.subn(
                   r"(?m)^([ \t]*file_picker:[ \t]*.*)$",
@@ -158,9 +36,8 @@ jobs:
 
           pub.write_text(text, encoding="utf-8")
 
-          # Migrate file_picker API to version 13
+          # Migrate file_picker API
           for dart_file in Path("lib").rglob("*.dart"):
-
               source = dart_file.read_text(encoding="utf-8")
 
               source = source.replace(
@@ -213,7 +90,6 @@ jobs:
           groovy = Path("android/app/build.gradle")
 
           if kts.exists():
-
               path = kts
               source = path.read_text(encoding="utf-8")
 
@@ -221,7 +97,6 @@ jobs:
                   ("compileSdk", "37"),
                   ("minSdk", "26"),
               ]:
-
                   pattern = rf"(?m)^([ \t]*{key}[ \t]*=[ \t]*).+$"
 
                   source, count = re.subn(
@@ -232,7 +107,7 @@ jobs:
                   )
 
                   if count != 1:
-                      raise SystemExit(f"Could not configure {key}")
+                      raise SystemExit(f"Cannot configure {key}")
 
               source = re.sub(
                   r"(?m)^([ \t]*sourceCompatibility[ \t]*=[ \t]*)JavaVersion\.\w+.*$",
@@ -246,14 +121,18 @@ jobs:
                   source,
               )
 
-              source = re.sub(
-                  r'(?m)^([ \t]*jvmTarget[ \t]*=[ \t]*).+$',
-                  r'\g<1>"17"',
+              # IMPORTANT: Correct Kotlin JVM target
+              source, count = re.subn(
+                  r"(?m)^([ \t]*jvmTarget[ \t]*=[ \t]*).+$",
+                  r"\g<1>org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17",
                   source,
+                  count=1,
               )
 
-          elif groovy.exists():
+              if count != 1:
+                  raise SystemExit("Could not configure Kotlin JVM target")
 
+          elif groovy.exists():
               path = groovy
               source = path.read_text(encoding="utf-8")
 
@@ -261,7 +140,6 @@ jobs:
                   ("compileSdkVersion", "37"),
                   ("minSdkVersion", "26"),
               ]:
-
                   if re.search(rf"(?m)^[ \t]*{key}[ \t]+", source):
                       pattern = rf"(?m)^([ \t]*{key}[ \t]+).+$"
                   else:
@@ -276,50 +154,42 @@ jobs:
                   )
 
                   if count != 1:
-                      raise SystemExit(f"Could not configure {key}")
-
-              source = re.sub(
-                  r"(?m)^([ \t]*sourceCompatibility[ \t]+)JavaVersion\.\w+.*$",
-                  r"\g<1>JavaVersion.VERSION_17",
-                  source,
-              )
-
-              source = re.sub(
-                  r"(?m)^([ \t]*targetCompatibility[ \t]+)JavaVersion\.\w+.*$",
-                  r"\g<1>JavaVersion.VERSION_17",
-                  source,
-              )
-
-              source = re.sub(
-                  r'(?m)^([ \t]*jvmTarget[ \t]*=[ \t]*).+$',
-                  r'\g<1>"17"',
-                  source,
-              )
+                      raise SystemExit(f"Cannot configure {key}")
 
           else:
               raise SystemExit("Android Gradle file not found")
 
           path.write_text(source, encoding="utf-8")
 
-          # Flutter 3.44 compatibility with legacy Kotlin mode
-          gradle_properties = Path("android/gradle.properties")
+          # AGP 9 compatibility
+          props = Path("android/gradle.properties")
+          props.parent.mkdir(parents=True, exist_ok=True)
 
-          if gradle_properties.exists():
+          gp = props.read_text(encoding="utf-8") if props.exists() else ""
 
-              gp = gradle_properties.read_text(encoding="utf-8")
+          for key, value in {
+              "android.builtInKotlin": "false",
+              "android.newDsl": "false",
+          }.items():
 
-              if "android.builtInKotlin=" not in gp:
+              pattern = rf"(?m)^[ \t]*{re.escape(key)}=.*$"
 
-                  gradle_properties.write_text(
-                      gp.rstrip() + "\nandroid.builtInKotlin=false\n",
-                      encoding="utf-8",
+              if re.search(pattern, gp):
+                  gp = re.sub(
+                      pattern,
+                      f"{key}={value}",
+                      gp,
+                      count=1,
                   )
+              else:
+                  gp = gp.rstrip() + f"\n{key}={value}\n"
 
-          # Android manifest
+          props.write_text(gp, encoding="utf-8")
+
+          # Android Manifest
           manifest = Path("android/app/src/main/AndroidManifest.xml")
 
           if manifest.exists():
-
               m = manifest.read_text(encoding="utf-8")
 
               m = re.sub(
@@ -330,7 +200,6 @@ jobs:
               )
 
               if "android.permission.CAMERA" not in m:
-
                   match = re.search(r"<manifest\b[^>]*>", m)
 
                   if not match:
@@ -344,150 +213,11 @@ jobs:
 
               manifest.write_text(m, encoding="utf-8")
 
-          print("file_picker configured")
-          print("mobile_scanner configured")
-          print("Android SDK 37 configured")
-          print("Java 17 configured")
-          print("Android configuration completed")
+          print("Dependencies configured")
+          print("Kotlin JVM target: JVM_17")
+          print("Android SDK: 37")
+          print("Minimum SDK: 26")
+          print("AGP 9 compatibility enabled")
+          print("Configuration completed successfully")
           PY
-
-      - name: Clean and Resolve
-        working-directory: ${{ steps.source.outputs.project }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          flutter clean
-          flutter pub get
-
-      - name: Download Official SingBox AAR
-        working-directory: ${{ steps.source.outputs.project }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PLUGIN_DIR="$(python3 - <<'PY'
-          import json
-          from pathlib import Path
-          from urllib.parse import unquote, urlparse
-
-          config = json.loads(
-              Path(".dart_tool/package_config.json").read_text(encoding="utf-8")
-          )
-
-          package = next(
-              item for item in config["packages"]
-              if item["name"] == "flutter_sing_box"
-          )
-
-          uri = urlparse(package["rootUri"])
-
-          if uri.scheme != "file":
-              raise SystemExit("Invalid package URI")
-
-          print(unquote(uri.path))
-          PY
-          )"
-
-          GRADLE="$PLUGIN_DIR/android/build.gradle.kts"
-          LIBDIR="$PLUGIN_DIR/android/libs"
-          AAR="$LIBDIR/libbox.aar"
-
-          test -f "$GRADLE"
-
-          mkdir -p "$LIBDIR"
-
-          curl -fL \
-            --retry 5 \
-            --retry-all-errors \
-            --retry-delay 3 \
-            --connect-timeout 30 \
-            "https://github.com/singbox-android/libbox/releases/download/1.14.3/libbox.aar" \
-            -o "$AAR"
-
-          test -s "$AAR"
-          unzip -tq "$AAR"
-
-          python3 - "$GRADLE" <<'PY'
-          from pathlib import Path
-          import sys
-
-          path = Path(sys.argv[1])
-          source = path.read_text(encoding="utf-8")
-
-          old = 'implementation("com.github.singbox-android:libbox:1.14.3")'
-          new = 'implementation(files("libs/libbox.aar"))'
-
-          if old in source:
-              source = source.replace(old, new, 1)
-
-          elif new not in source:
-              raise SystemExit("libbox dependency not found")
-
-          path.write_text(source, encoding="utf-8")
-
-          print("Local libbox configured")
-          PY
-
-      - name: Verify Native Dependency
-        working-directory: ${{ steps.source.outputs.project }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PLUGIN_DIR="$(python3 - <<'PY'
-          import json
-          from pathlib import Path
-          from urllib.parse import unquote, urlparse
-
-          config = json.loads(
-              Path(".dart_tool/package_config.json").read_text(encoding="utf-8")
-          )
-
-          package = next(
-              item for item in config["packages"]
-              if item["name"] == "flutter_sing_box"
-          )
-
-          uri = urlparse(package["rootUri"])
-          print(unquote(uri.path))
-          PY
-          )"
-
-          test -s "$PLUGIN_DIR/android/libs/libbox.aar"
-
-          grep -q 'libbox.aar' \
-            "$PLUGIN_DIR/android/build.gradle.kts"
-
-          echo "Native dependency verified"
-
-      - name: Verify Android SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-
-          test -d "$SDK_ROOT/platforms/android-37"
-          test -d "$SDK_ROOT/build-tools/37.0.0"
-
-          echo "Android SDK verified"
-
-      - name: Build Release APK
-        working-directory: ${{ steps.source.outputs.project }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          flutter build apk \
-            --release \
-            --target-platform android-arm64
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: VPNSOPR-Android-ARM64
-          path: ${{ steps.source.outputs.project }}/build/app/outputs/flutter-apk/app-release.apk
-          if-no-files-found: error
-          retention-days: 7
           
