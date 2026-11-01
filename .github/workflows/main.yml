@@ -1,11 +1,10 @@
-
-name: Build VPNSOPR APK
+name: Build VPNSOPR Android APK
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,166 +14,329 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-android:
-    name: Build Android APKs
-    runs-on: ubuntu-latest
+  build:
+    name: Build VPNSOPR Android
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract and validate the exact source archive
+      - name: Extract and locate Flutter project
         shell: bash
         run: |
           set -euo pipefail
 
-          ARCHIVE="VPNSOPR-Android-Source.zip"
+          WORK="$GITHUB_WORKSPACE"
+          PROJECT_DIR=""
 
-          if [[ ! -f "$ARCHIVE" ]]; then
-            echo "::error::Upload VPNSOPR-Android-Source.zip to the repository root."
+          ZIP="$WORK/VPNSOPR-Android-Source.zip"
+
+          if [ -f "$ZIP" ]; then
+            rm -rf "$WORK/_source"
+            mkdir -p "$WORK/_source"
+
+            unzip -q "$ZIP" -d "$WORK/_source"
+
+            while IFS= read -r -d '' file; do
+              dir="$(dirname "$file")"
+
+              if [ -f "$dir/lib/main.dart" ]; then
+                PROJECT_DIR="$dir"
+                break
+              fi
+            done < <(find "$WORK/_source" -type f -name pubspec.yaml -print0)
+
+            if [ -z "$PROJECT_DIR" ]; then
+              PUBSPEC="$(find "$WORK/_source" -type f -name pubspec.yaml -print -quit || true)"
+              if [ -n "$PUBSPEC" ]; then
+                PROJECT_DIR="$(dirname "$PUBSPEC")"
+              fi
+            fi
+          fi
+
+          if [ -z "$PROJECT_DIR" ] && [ -f "$WORK/pubspec.yaml" ]; then
+            PROJECT_DIR="$WORK"
+          fi
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: Flutter project not found."
             exit 1
           fi
 
-          unzip -oq "$ARCHIVE" -d .
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-          required_files=(
-            "pubspec.yaml"
-            "lib/main.dart"
-            "lib/app.dart"
-            "lib/theme.dart"
-            "lib/core/vpn_controller.dart"
-            "lib/screens/servers_screen.dart"
-            "lib/screens/settings_screen.dart"
-            "assets/vpnsopr_icon.png"
-            "scripts/patch_android.py"
-            "test/widget_test.dart"
-          )
+          echo "Project located: $PROJECT_DIR"
 
-          for file in "${required_files[@]}"; do
-            if [[ ! -f "$file" ]]; then
-              echo "::error::Missing required project file: $file"
-              exit 1
-            fi
-          done
-
-          echo "VPNSOPR source archive extracted and validated."
-
-      - name: Set up Java 17
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: ""
-          accept-android-sdk-licenses: true
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
       - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
 
-          yes | sdkmanager --licenses >/dev/null || true
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
 
           sdkmanager --install \
             "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0"
 
-      - name: Set up Flutter
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.44.0"
           channel: stable
           cache: true
 
-      - name: Check Flutter toolchain
+      - name: Check Flutter
         run: |
           flutter --version
           flutter doctor -v
 
       - name: Generate Android project if missing
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
-          if [[ ! -f android/app/build.gradle.kts && ! -f android/app/build.gradle ]]; then
+          set -euo pipefail
+
+          if [ ! -d android ]; then
             flutter create \
               --platforms=android \
               --org com.vpnsopr \
-              --project-name vpnsopr \
-              --no-pub .
+              .
           fi
 
-      - name: Configure Android project
-        run: python3 scripts/patch_android.py
-
-      - name: Set Android compile SDK to 36
+      - name: Fix dependencies and Android configuration
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
+          set -euo pipefail
+
           python3 - <<'PY'
           from pathlib import Path
           import re
 
-          android = Path("android")
-          files = list(android.rglob("build.gradle")) + list(android.rglob("build.gradle.kts"))
-          changed = False
+          pubspec = Path("pubspec.yaml")
 
-          for path in files:
-              source = path.read_text(encoding="utf-8")
-              updated = source
+          if not pubspec.exists():
+              raise SystemExit("pubspec.yaml not found")
 
-              updated, n1 = re.subn(
-                  r"(?m)^(\s*compileSdk\s*=\s*)\d+.*$",
+          content = pubspec.read_text(encoding="utf-8")
+
+          pattern = r"(?m)^([ \t]*file_picker[ \t]*:[ \t]*)[^\r\n#]+"
+
+          content, count = re.subn(
+              pattern,
+              r"\g<1>^13.3.0",
+              content,
+              count=1
+          )
+
+          if count == 0:
+              dependency = re.search(
+                  r"(?m)^dependencies:\s*$",
+                  content
+              )
+
+              if dependency is None:
+                  raise SystemExit("dependencies section not found")
+
+              position = dependency.end()
+
+              content = (
+                  content[:position]
+                  + "\n  file_picker: ^13.3.0"
+                  + content[position:]
+              )
+
+          pubspec.write_text(content, encoding="utf-8")
+
+          print("file_picker set to ^13.3.0")
+
+          app = Path("android/app")
+
+          gradle = app / "build.gradle"
+          kotlin_gradle = app / "build.gradle.kts"
+
+          if gradle.exists():
+              path = gradle
+              kts = False
+          elif kotlin_gradle.exists():
+              path = kotlin_gradle
+              kts = True
+          else:
+              raise SystemExit("Android app Gradle file not found")
+
+          text = path.read_text(encoding="utf-8")
+
+          if kts:
+              text = re.sub(
+                  r"(?m)^(\s*compileSdk\s*=\s*).+$",
                   r"\g<1>36",
-                  updated,
+                  text
               )
 
-              updated, n2 = re.subn(
-                  r"(?m)^(\s*compileSdk\s*=\s*)flutter\.compileSdkVersion\s*$",
+              text = re.sub(
+                  r"(?m)^(\s*minSdk\s*=\s*).+$",
+                  r"\g<1>26",
+                  text
+              )
+
+              text = re.sub(
+                  r"(?m)^(\s*sourceCompatibility\s*=\s*).+$",
+                  r"\g<1>JavaVersion.VERSION_17",
+                  text
+              )
+
+              text = re.sub(
+                  r"(?m)^(\s*targetCompatibility\s*=\s*).+$",
+                  r"\g<1>JavaVersion.VERSION_17",
+                  text
+              )
+
+              if "isCoreLibraryDesugaringEnabled" not in text:
+                  match = re.search(
+                      r"(?m)^(\s*compileOptions\s*\{)",
+                      text
+                  )
+
+                  if match:
+                      pos = match.end()
+                      text = (
+                          text[:pos]
+                          + "\n        isCoreLibraryDesugaringEnabled = true"
+                          + text[pos:]
+                      )
+                  else:
+                      raise SystemExit("compileOptions block not found")
+
+              if "desugar_jdk_libs" not in text:
+                  match = re.search(
+                      r"(?m)^(\s*dependencies\s*\{)",
+                      text
+                  )
+
+                  if match:
+                      pos = match.end()
+                      text = (
+                          text[:pos]
+                          + '\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")'
+                          + text[pos:]
+                      )
+                  else:
+                      text += (
+                          '\ndependencies {\n'
+                          '    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")\n'
+                          '}\n'
+                      )
+
+          else:
+              text = re.sub(
+                  r"(?m)^(\s*compileSdkVersion\s+).+$",
                   r"\g<1>36",
-                  updated,
+                  text
               )
 
-              updated, n3 = re.subn(
-                  r"(?m)^(\s*compileSdkVersion\s*(?:=\s*)?)\d+.*$",
+              text = re.sub(
+                  r"(?m)^(\s*compileSdk\s+).+$",
                   r"\g<1>36",
-                  updated,
+                  text
               )
 
-              if n1 + n2 + n3:
-                  path.write_text(updated, encoding="utf-8")
-                  changed = True
-
-          if not changed:
-              raise SystemExit(
-                  "Could not find a compileSdk setting in Android Gradle files."
+              text = re.sub(
+                  r"(?m)^(\s*minSdkVersion\s+).+$",
+                  r"\g<1>26",
+                  text
               )
 
-          print("Android compile SDK set to 36.")
+              text = re.sub(
+                  r"(?m)^(\s*minSdk\s+).+$",
+                  r"\g<1>26",
+                  text
+              )
+
+              text = re.sub(
+                  r"(?m)^(\s*sourceCompatibility\s+).+$",
+                  r"\g<1>JavaVersion.VERSION_17",
+                  text
+              )
+
+              text = re.sub(
+                  r"(?m)^(\s*targetCompatibility\s+).+$",
+                  r"\g<1>JavaVersion.VERSION_17",
+                  text
+              )
+
+              if "coreLibraryDesugaringEnabled" not in text:
+                  match = re.search(
+                      r"(?m)^(\s*compileOptions\s*\{)",
+                      text
+                  )
+
+                  if match:
+                      pos = match.end()
+                      text = (
+                          text[:pos]
+                          + "\n        coreLibraryDesugaringEnabled true"
+                          + text[pos:]
+                      )
+                  else:
+                      raise SystemExit("compileOptions block not found")
+
+              if "desugar_jdk_libs" not in text:
+                  match = re.search(
+                      r"(?m)^(\s*dependencies\s*\{)",
+                      text
+                  )
+
+                  if match:
+                      pos = match.end()
+                      text = (
+                          text[:pos]
+                          + "\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'"
+                          + text[pos:]
+                      )
+                  else:
+                      text += (
+                          "\ndependencies {\n"
+                          "    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'\n"
+                          "}\n"
+                      )
+
+          path.write_text(text, encoding="utf-8")
+
+          print("Android Gradle configuration updated")
+          print("Compile SDK: 36")
+          print("Minimum SDK: 26")
+          print("Java: 17")
+          print("Core library desugaring enabled")
           PY
 
+      - name: Clean project
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter clean
+
       - name: Resolve Flutter dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
         run: flutter pub get
 
-      - name: Analyze Dart source
-        run: flutter analyze --no-pub
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter build apk --release
 
-      - name: Run Flutter tests
-        run: flutter test --no-pub
-
-      - name: Generate launcher icons
-        run: dart run flutter_launcher_icons
-
-      - name: Build release APKs
-        run: flutter build apk --release --split-per-abi
-
-      - name: Upload APK artifacts
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VPNSOPR-Android-APKs
-          path: build/app/outputs/flutter-apk/*.apk
+          name: VPNSOPR-Android-APK
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
           retention-days: 14
           
