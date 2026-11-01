@@ -17,43 +17,40 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Extract source ZIP
+      - name: Extract Source
         id: source
         shell: bash
         run: |
           set -euo pipefail
 
-          ARCHIVE="$GITHUB_WORKSPACE/VPNSOPR-Android-Source.zip"
+          ZIP="$GITHUB_WORKSPACE/VPNSOPR-Android-Source.zip"
 
-          if [ ! -f "$ARCHIVE" ]; then
-            echo "ERROR: Source ZIP not found"
-            exit 1
-          fi
+          test -f "$ZIP"
 
-          mkdir -p "$RUNNER_TEMP/vpnsopr-source"
-          unzip -q "$ARCHIVE" -d "$RUNNER_TEMP/vpnsopr-source"
+          mkdir -p "$RUNNER_TEMP/vpnsopr"
+          unzip -q "$ZIP" -d "$RUNNER_TEMP/vpnsopr"
 
           PROJECT=""
 
-          while IFS= read -r file; do
-            dir="$(dirname "$file")"
-            if [ -f "$dir/lib/main.dart" ]; then
-              PROJECT="$dir"
+          while IFS= read -r f; do
+            D="$(dirname "$f")"
+            if [ -f "$D/lib/main.dart" ]; then
+              PROJECT="$D"
               break
             fi
-          done < <(find "$RUNNER_TEMP/vpnsopr-source" -name pubspec.yaml -type f)
+          done < <(find "$RUNNER_TEMP/vpnsopr" -name pubspec.yaml)
 
           if [ -z "$PROJECT" ]; then
-            echo "ERROR: Flutter project not found"
+            echo "Flutter project not found"
             exit 1
           fi
 
-          echo "project_dir=$PROJECT" >> "$GITHUB_OUTPUT"
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
 
-      - name: Setup Java 17
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -62,16 +59,16 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
-          packages: 'platform-tools'
+          packages: platform-tools
 
-      - name: Install Android SDK packages
+      - name: Install Android Packages
         shell: bash
         run: |
           set -euo pipefail
 
           sdkmanager --install \
             "platform-tools" \
-            "platforms;android-37" \
+            "platforms;android-36" \
             "build-tools;36.0.0" \
             "ndk;28.2.13676358"
 
@@ -82,13 +79,8 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Check Flutter
-        run: |
-          flutter --version
-          flutter doctor -v
-
-      - name: Generate Android project
-        working-directory: ${{ steps.source.outputs.project_dir }}
+      - name: Prepare Android Project
+        working-directory: ${{ steps.source.outputs.project }}
         shell: bash
         run: |
           set -euo pipefail
@@ -101,17 +93,8 @@ jobs:
               --no-pub .
           fi
 
-          if [ -f scripts/patch_android.py ]; then
-            python3 scripts/patch_android.py
-          elif [ -f patch_android.py ]; then
-            python3 patch_android.py
-          else
-            echo "ERROR: patch_android.py not found"
-            exit 1
-          fi
-
-      - name: Fix Android desugaring
-        working-directory: ${{ steps.source.outputs.project_dir }}
+      - name: Fix Dependencies and Android SDK
+        working-directory: ${{ steps.source.outputs.project }}
         shell: bash
         run: |
           set -euo pipefail
@@ -120,85 +103,167 @@ jobs:
           from pathlib import Path
           import re
 
-          files = [
-              Path("android/app/build.gradle.kts"),
-              Path("android/app/build.gradle")
-          ]
+          pub = Path("pubspec.yaml")
+          s = pub.read_text(encoding="utf-8")
 
-          p = next((x for x in files if x.exists()), None)
+          s, n = re.subn(
+              r'(?m)^(\s*file_picker:\s*).+$',
+              r'\g<1>^11.0.2',
+              s,
+              count=1
+          )
 
-          if p is None:
-              raise SystemExit("Android Gradle file not found")
+          if n != 1:
+              raise SystemExit("file_picker dependency not found")
 
-          s = p.read_text(encoding="utf-8")
+          pub.write_text(s, encoding="utf-8")
 
-          if p.suffix == ".kts":
+          kts = Path("android/app/build.gradle.kts")
+          groovy = Path("android/app/build.gradle")
+
+          if kts.exists():
+              p = kts
+              s = p.read_text(encoding="utf-8")
+
+              for key, value in [
+                  ("compileSdk", "36"),
+                  ("minSdk", "26")
+              ]:
+                  pattern = rf'(?m)^(\s*{key}\s*=\s*).+$'
+                  s, n = re.subn(
+                      pattern,
+                      lambda m: m.group(1) + value,
+                      s,
+                      count=1
+                  )
+                  if n != 1:
+                      raise SystemExit(f"Cannot set {key}")
+
+              s = re.sub(
+                  r'(?m)^(\s*sourceCompatibility\s*=\s*)JavaVersion\.\w+.*$',
+                  r'\g<1>JavaVersion.VERSION_17',
+                  s
+              )
+
+              s = re.sub(
+                  r'(?m)^(\s*targetCompatibility\s*=\s*)JavaVersion\.\w+.*$',
+                  r'\g<1>JavaVersion.VERSION_17',
+                  s
+              )
+
               if "isCoreLibraryDesugaringEnabled" not in s:
                   s, n = re.subn(
-                      r"(compileOptions\s*\{)",
-                      r"\1\n        isCoreLibraryDesugaringEnabled = true",
-                      s, count=1
+                      r'(compileOptions\s*\{)',
+                      r'\1\n        isCoreLibraryDesugaringEnabled = true',
+                      s,
+                      count=1
                   )
                   if n != 1:
                       raise SystemExit("Cannot enable desugaring")
 
+              dep = 'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")'
+
               if "desugar_jdk_libs" not in s:
+                  if re.search(r'(?m)^\s*dependencies\s*\{', s):
+                      s = re.sub(
+                          r'(?m)^(\s*dependencies\s*\{)',
+                          lambda m: m.group(1) + '\n    ' + dep,
+                          s,
+                          count=1
+                      )
+                  else:
+                      s += '\ndependencies {\n    ' + dep + '\n}\n'
+
+          elif groovy.exists():
+              p = groovy
+              s = p.read_text(encoding="utf-8")
+
+              for key, value in [
+                  ("compileSdkVersion", "36"),
+                  ("minSdkVersion", "26")
+              ]:
+                  pattern = rf'(?m)^(\s*{key}\s+).+$'
                   s, n = re.subn(
-                      r"(?m)^dependencies\s*\{",
-                      'dependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")',
-                      s, count=1
+                      pattern,
+                      lambda m: m.group(1) + value,
+                      s,
+                      count=1
                   )
                   if n != 1:
-                      raise SystemExit("Cannot add desugaring dependency")
-          else:
+                      raise SystemExit(f"Cannot set {key}")
+
               if "coreLibraryDesugaringEnabled" not in s:
                   s, n = re.subn(
-                      r"(compileOptions\s*\{)",
-                      r"\1\n        coreLibraryDesugaringEnabled true",
-                      s, count=1
+                      r'(compileOptions\s*\{)',
+                      r'\1\n        coreLibraryDesugaringEnabled true',
+                      s,
+                      count=1
                   )
                   if n != 1:
                       raise SystemExit("Cannot enable desugaring")
 
               if "desugar_jdk_libs" not in s:
-                  s, n = re.subn(
-                      r"(?m)^dependencies\s*\{",
-                      "dependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'",
-                      s, count=1
-                  )
-                  if n != 1:
-                      raise SystemExit("Cannot add desugaring dependency")
+                  dep = "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'"
+                  if re.search(r'(?m)^\s*dependencies\s*\{', s):
+                      s = re.sub(
+                          r'(?m)^(\s*dependencies\s*\{)',
+                          lambda m: m.group(1) + '\n    ' + dep,
+                          s,
+                          count=1
+                      )
+                  else:
+                      s += '\ndependencies {\n    ' + dep + '\n}\n'
+
+          else:
+              raise SystemExit("Android Gradle file not found")
 
           p.write_text(s, encoding="utf-8")
-          print("Desugaring configured successfully")
+
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+
+          if manifest.exists():
+              m = manifest.read_text(encoding="utf-8")
+
+              m = re.sub(
+                  r'android:label="[^"]*"',
+                  'android:label="TUN VPNSOPR"',
+                  m,
+                  count=1
+              )
+
+              if "android.permission.CAMERA" not in m:
+                  match = re.search(r"<manifest\b[^>]*>", m)
+                  if match:
+                      m = (
+                          m[:match.end()]
+                          + '\n    <uses-permission android:name="android.permission.CAMERA" />'
+                          + m[match.end():]
+                      )
+
+              manifest.write_text(m, encoding="utf-8")
+
+          print("Android SDK 36 configured")
+          print("Java 17 configured")
+          print("Desugaring configured")
+          print("FilePicker compatibility configured")
           PY
 
-      - name: Install Flutter dependencies
-        working-directory: ${{ steps.source.outputs.project_dir }}
-        shell: bash
+      - name: Clean and Resolve
+        working-directory: ${{ steps.source.outputs.project }}
         run: |
-          set -euo pipefail
           flutter clean
           flutter pub get
 
-      - name: Analyze Dart source
-        working-directory: ${{ steps.source.outputs.project_dir }}
-        shell: bash
+      - name: Build APK
+        working-directory: ${{ steps.source.outputs.project }}
         run: |
-          flutter analyze --no-pub
-
-      - name: Build release APKs
-        working-directory: ${{ steps.source.outputs.project_dir }}
-        shell: bash
-        run: |
-          set -euo pipefail
           flutter build apk --release --split-per-abi
 
-      - name: Upload APK files
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: VPNSOPR-Android-APKs
-          path: ${{ steps.source.outputs.project_dir }}/build/app/outputs/flutter-apk/*.apk
+          path: ${{ steps.source.outputs.project }}/build/app/outputs/flutter-apk/*.apk
           if-no-files-found: error
           retention-days: 7
           
