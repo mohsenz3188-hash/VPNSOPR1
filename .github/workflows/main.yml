@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: vpnsopr-build-${{ github.ref }}
+  group: vpnsopr-android-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -60,12 +60,11 @@ jobs:
           fi
 
           if [ -z "$PROJECT" ]; then
-            echo "Flutter source not found"
+            echo "Flutter project not found"
             exit 1
           fi
 
           echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
-          echo "Project: $PROJECT"
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -80,15 +79,17 @@ jobs:
           accept-android-sdk-licenses: true
           log-accepted-android-sdk-licenses: false
 
-      - name: Install Android SDK packages
+      - name: Install Android SDK 37
         shell: bash
         run: |
           set -euo pipefail
 
-          sdkmanager --install \
+          sdkmanager --channel=3 --install \
             "platform-tools" \
-            "platforms;android-37" \
-            "build-tools;36.0.0"
+            "platforms;android-37.0" \
+            "build-tools;37.0.0"
+
+          echo "Android SDK 37 installed successfully"
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -100,6 +101,7 @@ jobs:
         run: |
           flutter --version
           dart --version
+          flutter doctor -v
 
       - name: Generate Android project
         working-directory: ${{ env.PROJECT_DIR }}
@@ -115,7 +117,7 @@ jobs:
               --no-pub .
           fi
 
-      - name: Configure VPNSOPR dependencies
+      - name: Configure VPNSOPR
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
@@ -128,13 +130,11 @@ jobs:
           pubspec = Path("pubspec.yaml")
 
           if not pubspec.exists():
-              raise SystemExit("pubspec.yaml not found")
+              raise SystemExit("pubspec.yaml missing")
 
           content = pubspec.read_text(encoding="utf-8")
 
-          pattern = (
-              r"(?m)^([ \t]*file_picker[ \t]*:[ \t]*)[^\r\n#]+"
-          )
+          pattern = r"(?m)^([ \t]*file_picker[ \t]*:[ \t]*)[^\r\n#]+"
 
           content, count = re.subn(
               pattern,
@@ -144,13 +144,10 @@ jobs:
           )
 
           if count == 0:
-              match = re.search(
-                  r"(?m)^dependencies:[ \t]*$",
-                  content
-              )
+              match = re.search(r"(?m)^dependencies:[ \t]*$", content)
 
               if not match:
-                  raise SystemExit("Dependencies section not found")
+                  raise SystemExit("Dependencies section missing")
 
               pos = match.end()
               content = (
@@ -161,10 +158,8 @@ jobs:
 
           pubspec.write_text(content, encoding="utf-8")
 
-          app = Path("android/app")
-
-          kts = app / "build.gradle.kts"
-          groovy = app / "build.gradle"
+          kts = Path("android/app/build.gradle.kts")
+          groovy = Path("android/app/build.gradle")
 
           if kts.exists():
               path = kts
@@ -173,28 +168,29 @@ jobs:
               path = groovy
               is_kts = False
           else:
-              raise SystemExit("Android Gradle file not found")
+              raise SystemExit("Gradle file missing")
 
-          text = path.read_text(encoding="utf-8")
+          source = path.read_text(encoding="utf-8")
 
           def replace_one(patterns, replacement, label):
-              global text
+              global source
 
               for pattern in patterns:
                   updated, count = re.subn(
                       pattern,
                       replacement,
-                      text,
+                      source,
                       count=1
                   )
 
                   if count:
-                      text = updated
+                      source = updated
                       return
 
               raise SystemExit("Cannot configure " + label)
 
           if is_kts:
+
               replace_one(
                   [r"(?m)^([ \t]*compileSdk[ \t]*=[ \t]*).+$"],
                   r"\g<1>37",
@@ -210,29 +206,30 @@ jobs:
               replace_one(
                   [r"(?m)^([ \t]*sourceCompatibility[ \t]*=[ \t]*).+$"],
                   r"\g<1>JavaVersion.VERSION_17",
-                  "sourceCompatibility"
+                  "Java compatibility"
               )
 
               replace_one(
                   [r"(?m)^([ \t]*targetCompatibility[ \t]*=[ \t]*).+$"],
                   r"\g<1>JavaVersion.VERSION_17",
-                  "targetCompatibility"
+                  "Java target"
               )
 
-              if "isCoreLibraryDesugaringEnabled" not in text:
+              if "isCoreLibraryDesugaringEnabled" not in source:
                   match = re.search(
                       r"(?m)^([ \t]*compileOptions[ \t]*\{)",
-                      text
+                      source
                   )
 
                   if not match:
-                      raise SystemExit("compileOptions block missing")
+                      raise SystemExit("compileOptions missing")
 
                   pos = match.end()
-                  text = (
-                      text[:pos]
+
+                  source = (
+                      source[:pos]
                       + "\n        isCoreLibraryDesugaringEnabled = true"
-                      + text[pos:]
+                      + source[pos:]
                   )
 
               dependency = (
@@ -241,6 +238,7 @@ jobs:
               )
 
           else:
+
               replace_one(
                   [
                       r"(?m)^([ \t]*compileSdkVersion[ \t]+).+$",
@@ -262,29 +260,30 @@ jobs:
               replace_one(
                   [r"(?m)^([ \t]*sourceCompatibility[ \t]+).+$"],
                   r"\g<1>JavaVersion.VERSION_17",
-                  "sourceCompatibility"
+                  "Java compatibility"
               )
 
               replace_one(
                   [r"(?m)^([ \t]*targetCompatibility[ \t]+).+$"],
                   r"\g<1>JavaVersion.VERSION_17",
-                  "targetCompatibility"
+                  "Java target"
               )
 
-              if "coreLibraryDesugaringEnabled" not in text:
+              if "coreLibraryDesugaringEnabled" not in source:
                   match = re.search(
                       r"(?m)^([ \t]*compileOptions[ \t]*\{)",
-                      text
+                      source
                   )
 
                   if not match:
-                      raise SystemExit("compileOptions block missing")
+                      raise SystemExit("compileOptions missing")
 
                   pos = match.end()
-                  text = (
-                      text[:pos]
+
+                  source = (
+                      source[:pos]
                       + "\n        coreLibraryDesugaringEnabled true"
-                      + text[pos:]
+                      + source[pos:]
                   )
 
               dependency = (
@@ -292,27 +291,27 @@ jobs:
                   "'com.android.tools:desugar_jdk_libs:2.1.5'"
               )
 
-          if "desugar_jdk_libs" not in text:
+          if "desugar_jdk_libs" not in source:
               match = re.search(
                   r"(?m)^([ \t]*dependencies[ \t]*\{)",
-                  text
+                  source
               )
 
               if match:
                   pos = match.end()
-                  text = (
-                      text[:pos]
+                  source = (
+                      source[:pos]
                       + "\n" + dependency
-                      + text[pos:]
+                      + source[pos:]
                   )
               else:
-                  text += (
+                  source += (
                       "\ndependencies {\n"
                       + dependency
                       + "\n}\n"
                   )
 
-          path.write_text(text, encoding="utf-8")
+          path.write_text(source, encoding="utf-8")
 
           manifest = Path(
               "android/app/src/main/AndroidManifest.xml"
@@ -329,10 +328,7 @@ jobs:
               )
 
               if "android.permission.CAMERA" not in content:
-                  match = re.search(
-                      r"<manifest\b[^>]*>",
-                      content
-                  )
+                  match = re.search(r"<manifest\b[^>]*>", content)
 
                   if match:
                       pos = match.end()
@@ -344,19 +340,18 @@ jobs:
 
               manifest.write_text(content, encoding="utf-8")
 
-          print("VPNSOPR Android configuration completed")
-          print("compileSdk: 37")
-          print("minSdk: 26")
+          print("VPNSOPR configuration completed")
+          print("Compile SDK: 37")
+          print("Minimum SDK: 26")
           print("Java: 17")
           print("Desugaring: enabled")
-          print("file_picker: ^13.3.0")
           PY
 
-      - name: Clean Flutter
+      - name: Clean project
         working-directory: ${{ env.PROJECT_DIR }}
         run: flutter clean
 
-      - name: Install Flutter dependencies
+      - name: Resolve dependencies
         working-directory: ${{ env.PROJECT_DIR }}
         run: flutter pub get
 
@@ -364,10 +359,11 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}
         run: flutter build apk --release
 
-      - name: Upload VPNSOPR APK
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: VPNSOPR-Android-APK
           path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
           retention-days: 14
+          
